@@ -15,6 +15,18 @@ const showTyping = ref(false)
 const loading = ref(true)
 const loadingMessages = ref(false)
 const error = ref(null)
+const sending = ref(false)
+const fileInputRef = ref(null)
+const isRecording = ref(false)
+const recordingDuration = ref(0)
+const showNewChatModal = ref(false)
+const newChatPhone = ref('')
+const newChatLoading = ref(false)
+const newChatError = ref('')
+const searchQuery = ref('')
+let _mediaRecorder = null
+let _audioChunks = []
+let _recordingTimer = null
 
 // ── Data ──
 const contacts = ref([])
@@ -178,15 +190,36 @@ async function loadInstances() {
       filters,
       fields: ['name', 'instance_id', 'agent_name', 'last_activity', 'message_count', 'title', 'status'],
       order_by: 'last_activity desc',
-      limit: 50,
+      limit_page_length: 50,
     })
+
+    // Fetch the latest sender_name for each instance (from the most recent user message)
+    const senderNames = {}
+    for (const row of (rows || [])) {
+      try {
+        const userMsgs = await frappe('frappe.client.get_list', {
+          doctype: 'Runtime Message',
+          filters: [['instance', '=', row.name], ['role', '=', 'user'], ['sender_name', 'is', 'set']],
+          fields: ['sender_name'],
+          order_by: 'creation desc',
+          limit_page_length: 1,
+        })
+        if (userMsgs && userMsgs.length > 0 && userMsgs[0].sender_name) {
+          senderNames[row.name] = userMsgs[0].sender_name
+        }
+      } catch (e) {
+        console.warn('[channels-ui] Failed to fetch sender_name for', row.name, e)
+      }
+    }
+    console.log('[channels-ui] senderNames:', senderNames)
 
     contacts.value = (rows || []).map((row, idx) => {
       const phone = formatPhone(row.instance_id)
+      const displayName = senderNames[row.name] || phone
       return {
         id: row.name,           // instance name (doc id)
         instanceId: row.instance_id,
-        name: phone,
+        name: displayName,
         phone,
         lastMsg: `${row.message_count || 0} messages`,
         time: formatTime(row.last_activity),
@@ -223,9 +256,9 @@ async function loadMessages(instanceName, silent = false) {
     const rows = await frappe('frappe.client.get_list', {
       doctype: 'Runtime Message',
       filters: [['instance', '=', instanceName]],
-      fields: ['name', 'role', 'content', 'tool_calls', 'creation'],
+      fields: ['name', 'role', 'content', 'tool_calls', 'creation', 'sender_name', 'message_status', 'attachments'],
       order_by: 'creation asc',
-      limit: 200,
+      limit_page_length: 200,
     })
 
     const contact = contacts.value.find(c => c.id === instanceName)
@@ -258,6 +291,7 @@ async function loadMessages(instanceName, silent = false) {
           sender: 'user',
           time: timeStr,
           read: true,
+          senderName: row.sender_name || '',
         })
       } else if (row.role === 'assistant') {
         let toolLabel = null
@@ -282,7 +316,58 @@ async function loadMessages(instanceName, silent = false) {
           }
         } catch {}
 
+        // Parse attachments if present
+        let attachments = null
+        try {
+          if (row.attachments) attachments = JSON.parse(row.attachments)
+        } catch {}
+
         // Show the actual message sent to the user (from tool call args)
+        // null = pre-tracking message (assume delivered), otherwise use DB value
+        const deliveryStatus = row.message_status || 'delivered'
+
+        // If message has attachments, render as media
+        if (attachments && attachments.length > 0) {
+          const att = attachments[0]
+          const mime = att.file_type || ''
+          const caption = (row.content || '').replace(/^\[.*?\]\s*/, '').trim()
+          if (mime.startsWith('image/')) {
+            uiMsgs.push({
+              id: row.name,
+              type: 'image',
+              imageUrl: att.file_url,
+              caption: caption || null,
+              sender: 'agent',
+              time: timeStr,
+              senderName: row.sender_name || agentName,
+              delivered: deliveryStatus,
+            })
+          } else if (mime.startsWith('audio/')) {
+            uiMsgs.push({
+              id: row.name,
+              type: 'voice',
+              audioUrl: att.file_url,
+              text: caption || null,
+              sender: 'agent',
+              time: timeStr,
+              senderName: row.sender_name || agentName,
+              delivered: deliveryStatus,
+            })
+          } else {
+            uiMsgs.push({
+              id: row.name,
+              type: 'document',
+              filename: att.file_name || 'file',
+              fileUrl: att.file_url,
+              sender: 'agent',
+              time: timeStr,
+              senderName: row.sender_name || agentName,
+              delivered: deliveryStatus,
+            })
+          }
+          continue
+        }
+
         if (sentText) {
           uiMsgs.push({
             id: row.name,
@@ -293,6 +378,8 @@ async function loadMessages(instanceName, silent = false) {
             isAI: true,
             agentName,
             agentTool: toolLabel || null,
+            senderName: row.sender_name || agentName,
+            delivered: deliveryStatus,
           })
         } else if (sentVoice) {
           uiMsgs.push({
@@ -303,6 +390,8 @@ async function loadMessages(instanceName, silent = false) {
             time: timeStr,
             isAI: true,
             agentName,
+            senderName: row.sender_name || agentName,
+            delivered: deliveryStatus,
           })
         } else if (row.content) {
           // Fallback: show agent content if no WA send tool was called
@@ -315,15 +404,21 @@ async function loadMessages(instanceName, silent = false) {
             isAI: true,
             agentName,
             agentTool: toolLabel || null,
+            senderName: row.sender_name || agentName,
+            delivered: deliveryStatus,
           })
         }
       }
     }
 
-    // Update contact's lastMsg with the last user message
+    // Update contact's lastMsg and name with the last user message
     const lastUserMsg = [...(rows || [])].reverse().find(r => r.role === 'user')
     if (lastUserMsg && contact) {
       contact.lastMsg = (lastUserMsg.content || '').slice(0, 60)
+      // Update contact display name from sender_name if available
+      if (lastUserMsg.sender_name) {
+        contact.name = lastUserMsg.sender_name
+      }
     }
 
     const prevCount = messagesCache.value[instanceName]?.length || 0
@@ -343,6 +438,15 @@ async function loadMessages(instanceName, silent = false) {
 const selectedContact = computed(() => contacts.value.find(c => c.id === selectedContactId.value))
 const selectedMessages = computed(() => messagesCache.value[selectedContactId.value] || [])
 const badgeConfig = computed(() => statusConfig.default)
+const filteredContacts = computed(() => {
+  const q = searchQuery.value.trim().toLowerCase()
+  if (!q) return contacts.value
+  return contacts.value.filter(c =>
+    c.name.toLowerCase().includes(q) ||
+    c.phone.toLowerCase().includes(q) ||
+    c.instanceId.toLowerCase().includes(q)
+  )
+})
 
 // ── Render helpers ──
 const renderText = (text) => {
@@ -368,22 +472,239 @@ const selectContact = async (id) => {
   scrollToBottom()
 }
 
-const sendMessage = () => {
-  if (!messageInput.value.trim() || !selectedContactId.value) return
+const openNewChat = () => {
+  newChatPhone.value = ''
+  newChatError.value = ''
+  showNewChatModal.value = true
+}
+
+const startNewChat = async () => {
+  const raw = newChatPhone.value.trim().replace(/[+\s\-()]/g, '')
+  if (!raw || !/^\d{7,15}$/.test(raw)) {
+    newChatError.value = 'Enter a valid phone number with country code (e.g. 919876543210)'
+    return
+  }
+  newChatLoading.value = true
+  newChatError.value = ''
+  try {
+    const res = await frappe('sena_agents_backend.sena_agents_backend.api.whatsapp.find_or_create_chat', { phone: raw })
+    const instanceId = res.instance_id
+    showNewChatModal.value = false
+
+    // Reload sidebar to include the new/existing contact
+    await loadInstances()
+
+    // Select the contact
+    const existing = contacts.value.find(c => c.id === instanceId)
+    if (existing) {
+      selectedContactId.value = instanceId
+      await loadMessages(instanceId)
+      scrollToBottom()
+    } else {
+      // If not in list (e.g. agent filter), add it manually
+      contacts.value.unshift({
+        id: instanceId,
+        instanceId,
+        name: raw,
+        phone: raw,
+        lastMsg: 'New conversation',
+        time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+        unread: 0,
+        company: '',
+        status: 'Active',
+        online: false,
+        color: avatarColors[contacts.value.length % avatarColors.length],
+        agentName: '',
+        lastActivity: new Date().toISOString(),
+        messageCount: 0,
+      })
+      selectedContactId.value = instanceId
+    }
+  } catch (e) {
+    newChatError.value = e.message || 'Failed to start chat'
+  } finally {
+    newChatLoading.value = false
+  }
+}
+
+const sendMessage = async () => {
+  if (!messageInput.value.trim() || !selectedContactId.value || sending.value) return
   const id = selectedContactId.value
-  if (!messagesCache.value[id]) messagesCache.value[id] = []
-  messagesCache.value[id].push({
-    id: Date.now(),
-    type: 'text',
-    text: messageInput.value,
-    sender: 'user',
-    time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-    read: false,
-  })
+  const text = messageInput.value.trim()
   messageInput.value = ''
-  showTyping.value = true
-  setTimeout(() => { showTyping.value = false }, 2200)
+  sending.value = true
+
+  // Optimistically add to cache
+  if (!messagesCache.value[id]) messagesCache.value[id] = []
+  const optimisticId = `temp-${Date.now()}`
+  messagesCache.value[id].push({
+    id: optimisticId,
+    type: 'agent',
+    text,
+    sender: 'agent',
+    time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+    isAI: false,
+    agentName: 'Operator',
+    senderName: 'Operator',
+    delivered: 'sent',
+  })
   scrollToBottom()
+
+  try {
+    await frappe('sena_agents_backend.sena_agents_backend.api.whatsapp.send_direct_message', {
+      instance_id: id,
+      message: text,
+    })
+    // Reload to get the real persisted message
+    await loadMessages(id, true)
+    scrollToBottom()
+  } catch (e) {
+    console.error('[channels-ui] sendMessage failed:', e)
+    // Remove optimistic message on failure
+    const msgs = messagesCache.value[id]
+    const idx = msgs.findIndex(m => m.id === optimisticId)
+    if (idx !== -1) msgs.splice(idx, 1)
+    // Restore text so user can retry
+    messageInput.value = text
+  } finally {
+    sending.value = false
+  }
+}
+
+const triggerFileUpload = () => {
+  if (fileInputRef.value) fileInputRef.value.click()
+}
+
+const handleFileUpload = async (event) => {
+  const file = event.target.files?.[0]
+  if (!file || !selectedContactId.value) return
+  const id = selectedContactId.value
+  sending.value = true
+
+  try {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('instance_id', id)
+    // Inject sid for auth (cookies may not work in iframe context)
+    if (_sid) formData.append('sid', _sid)
+
+    const headers = { Accept: 'application/json' }
+    if (_csrfToken) headers['X-Frappe-CSRF-Token'] = _csrfToken
+
+    console.log('[channels-ui] Uploading file:', file.name, file.type, file.size, 'to', id)
+
+    const resp = await fetch('/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.send_direct_media', {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: formData,
+    })
+    const data = await resp.json()
+    console.log('[channels-ui] Upload response:', resp.status, data)
+    if (!resp.ok) throw new Error(data.exception || data.exc || `HTTP ${resp.status}`)
+    if (data.message?.status === 'error') throw new Error(data.message.error)
+    await loadMessages(id, true)
+    scrollToBottom()
+  } catch (e) {
+    console.error('[channels-ui] File upload failed:', e)
+    alert('File upload failed: ' + (e.message || e))
+  } finally {
+    sending.value = false
+    if (fileInputRef.value) fileInputRef.value.value = ''
+  }
+}
+
+const startRecording = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    _audioChunks = []
+    _mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' })
+    _mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) _audioChunks.push(e.data) }
+    _mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop())
+      clearInterval(_recordingTimer)
+      isRecording.value = false
+      recordingDuration.value = 0
+
+      if (_audioChunks.length === 0) return
+      const blob = new Blob(_audioChunks, { type: 'audio/ogg' })
+      await sendVoiceNote(blob)
+    }
+    _mediaRecorder.start()
+    isRecording.value = true
+    recordingDuration.value = 0
+    _recordingTimer = setInterval(() => { recordingDuration.value++ }, 1000)
+  } catch (e) {
+    console.error('[channels-ui] Microphone access denied:', e)
+  }
+}
+
+const stopRecording = () => {
+  if (_mediaRecorder && _mediaRecorder.state !== 'inactive') {
+    _mediaRecorder.stop()
+  }
+}
+
+const cancelRecording = () => {
+  if (_mediaRecorder && _mediaRecorder.state !== 'inactive') {
+    _mediaRecorder.ondataavailable = null
+    _mediaRecorder.onstop = () => {
+      _mediaRecorder.stream?.getTracks().forEach(t => t.stop())
+      clearInterval(_recordingTimer)
+      isRecording.value = false
+      recordingDuration.value = 0
+    }
+    _mediaRecorder.stop()
+  }
+}
+
+const sendVoiceNote = async (blob) => {
+  if (!selectedContactId.value) return
+  const id = selectedContactId.value
+  sending.value = true
+  try {
+    const formData = new FormData()
+    formData.append('file', blob, 'voice-note.ogg')
+    formData.append('instance_id', id)
+    if (_sid) formData.append('sid', _sid)
+
+    const headers = { Accept: 'application/json' }
+    if (_csrfToken) headers['X-Frappe-CSRF-Token'] = _csrfToken
+
+    const resp = await fetch('/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.send_direct_media', {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: formData,
+    })
+    const data = await resp.json()
+    if (!resp.ok) throw new Error(data.exception || data.exc || `HTTP ${resp.status}`)
+    await loadMessages(id, true)
+    scrollToBottom()
+  } catch (e) {
+    console.error('[channels-ui] Voice note send failed:', e)
+  } finally {
+    sending.value = false
+  }
+}
+
+const toggleAudio = (msg) => {
+  const audio = msg._audio
+  if (!audio) return
+  if (msg.playing) {
+    audio.pause()
+    msg.playing = false
+  } else {
+    audio.play()
+    msg.playing = true
+    audio.onended = () => { msg.playing = false }
+  }
+}
+
+const formatRecordingTime = (seconds) => {
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  return `${m}:${s.toString().padStart(2, '0')}`
 }
 
 // ── Lifecycle ──
@@ -430,11 +751,8 @@ watch(selectedContactId, async (id) => {
           <span class="sidebar__brand-name">Channels</span>
         </div>
         <div class="sidebar__header-actions">
-          <button class="sidebar__icon-btn">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-          </button>
-          <button class="sidebar__icon-btn">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg>
+          <button class="sidebar__icon-btn" @click="openNewChat" title="New chat">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           </button>
         </div>
       </div>
@@ -455,7 +773,7 @@ watch(selectedContactId, async (id) => {
       <!-- Search -->
       <div class="sidebar__search">
         <svg class="sidebar__search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-        <input type="text" class="sidebar__search-input" placeholder="Search or start new chat" />
+        <input v-model="searchQuery" type="text" class="sidebar__search-input" placeholder="Search or start new chat" />
       </div>
 
       <!-- Contact list -->
@@ -486,7 +804,7 @@ watch(selectedContactId, async (id) => {
         <!-- Contact rows -->
         <div
           v-else
-          v-for="contact in contacts"
+          v-for="contact in filteredContacts"
           :key="contact.id"
           :class="['contact', { 'contact--active': selectedContactId === contact.id }]"
           @click="selectContact(contact.id)"
@@ -503,6 +821,9 @@ watch(selectedContactId, async (id) => {
             <div class="contact__row2">
               <span class="contact__preview">{{ contact.lastMsg }}</span>
               <span v-if="contact.unread" class="contact__unread">{{ contact.unread }}</span>
+            </div>
+            <div v-if="contact.name !== contact.phone" class="contact__row2">
+              <span class="contact__preview" style="font-size: 10px; color: #94A3B8;">{{ contact.phone }}</span>
             </div>
             <div class="contact__row3">
               <span class="contact__company">{{ contact.company }}</span>
@@ -569,25 +890,22 @@ watch(selectedContactId, async (id) => {
             <span>{{ msg.label }}</span>
           </div>
 
-          <!-- User text bubble -->
-          <div v-else-if="msg.type === 'text' && msg.sender === 'user'" class="msg msg--out">
-            <div class="bubble bubble--out">
+          <!-- User text bubble (received — left side) -->
+          <div v-else-if="msg.type === 'text' && msg.sender === 'user'" class="msg msg--in">
+            <div class="bubble bubble--in">
+              <div v-if="msg.senderName" class="bubble__sender-header">
+                <span class="bubble__sender-name">{{ msg.senderName }}</span>
+              </div>
               <div class="bubble__text" v-html="renderText(msg.text)"></div>
               <div class="bubble__meta">
                 <span class="bubble__time">{{ msg.time }}</span>
-                <span class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.read }">
-                  <svg width="14" height="10" viewBox="0 0 14 10" fill="none">
-                    <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                  </svg>
-                </span>
               </div>
             </div>
           </div>
 
-          <!-- Agent AI bubble -->
-          <div v-else-if="msg.type === 'agent'" class="msg msg--in">
-            <div class="bubble bubble--in">
+          <!-- Agent AI bubble (sent — right side) -->
+          <div v-else-if="msg.type === 'agent'" class="msg msg--out">
+            <div class="bubble bubble--out">
               <div class="bubble__agent-header">
                 <span class="bubble__agent-dot"></span>
                 <span class="bubble__agent-name">{{ msg.agentName }}</span>
@@ -599,16 +917,27 @@ watch(selectedContactId, async (id) => {
               <div class="bubble__text" v-html="renderText(msg.text)"></div>
               <div class="bubble__meta">
                 <span class="bubble__time">{{ msg.time }}</span>
+                <span class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.delivered === 'read', 'bubble__ticks--delivered': msg.delivered === 'delivered' }">
+                  <svg v-if="msg.delivered === 'sent'" width="14" height="10" viewBox="0 0 14 10" fill="none">
+                    <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                  <svg v-else width="14" height="10" viewBox="0 0 14 10" fill="none">
+                    <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </span>
               </div>
             </div>
           </div>
 
           <!-- Voice note -->
-          <div v-else-if="msg.type === 'voice'" class="msg" :class="msg.sender === 'user' ? 'msg--out' : 'msg--in'">
-            <div class="bubble" :class="msg.sender === 'user' ? 'bubble--out' : 'bubble--in'">
+          <div v-else-if="msg.type === 'voice'" class="msg" :class="msg.sender === 'user' ? 'msg--in' : 'msg--out'">
+            <div class="bubble" :class="msg.sender === 'user' ? 'bubble--in' : 'bubble--out'">
               <div class="voice">
-                <div class="voice__play">
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                <audio v-if="msg.audioUrl" :src="msg.audioUrl" :ref="el => { if (el) msg._audio = el }" preload="metadata"></audio>
+                <div class="voice__play" @click="toggleAudio(msg)" style="cursor:pointer">
+                  <svg v-if="!msg.playing" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+                  <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="3" width="4" height="18"/><rect x="15" y="3" width="4" height="18"/></svg>
                 </div>
                 <div class="voice__track">
                   <div class="voice__bars">
@@ -622,43 +951,49 @@ watch(selectedContactId, async (id) => {
               <div v-if="msg.text" class="voice__transcript">{{ msg.text }}</div>
               <div class="bubble__meta">
                 <span class="bubble__time">{{ msg.time }}</span>
-                <span v-if="msg.sender === 'user'" class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.read }">
-                  <svg width="14" height="10" viewBox="0 0 14 10" fill="none"><path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                <span v-if="msg.sender === 'agent'" class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.delivered === 'read', 'bubble__ticks--delivered': msg.delivered === 'delivered' }">
+                  <svg v-if="msg.delivered === 'sent'" width="14" height="10" viewBox="0 0 14 10" fill="none"><path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <svg v-else width="14" height="10" viewBox="0 0 14 10" fill="none"><path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
                 </span>
               </div>
             </div>
           </div>
 
           <!-- Image -->
-          <div v-else-if="msg.type === 'image'" class="msg" :class="msg.sender === 'user' ? 'msg--out' : 'msg--in'">
-            <div class="bubble bubble--media" :class="msg.sender === 'user' ? 'bubble--out' : 'bubble--in'">
-              <div class="img-frame" :style="{ background: msg.gradient }">
-                <svg class="img-icon" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.6)" stroke-width="1"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
-                <div class="img-meta">
-                  <span class="bubble__time" style="color:rgba(255,255,255,0.9);">{{ msg.time }}</span>
-                </div>
-              </div>
+          <div v-else-if="msg.type === 'image'" class="msg" :class="msg.sender === 'user' ? 'msg--in' : 'msg--out'">
+            <div class="bubble bubble--media" :class="msg.sender === 'user' ? 'bubble--in' : 'bubble--out'">
+              <a :href="msg.imageUrl" target="_blank"><img v-if="msg.imageUrl" :src="msg.imageUrl" class="img-actual" /></a>
               <div v-if="msg.caption" class="img-caption">{{ msg.caption }}</div>
+              <div class="bubble__meta">
+                <span class="bubble__time">{{ msg.time }}</span>
+                <span v-if="msg.sender === 'agent'" class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.delivered === 'read', 'bubble__ticks--delivered': msg.delivered === 'delivered' }">
+                  <svg v-if="msg.delivered === 'sent'" width="14" height="10" viewBox="0 0 14 10" fill="none"><path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <svg v-else width="14" height="10" viewBox="0 0 14 10" fill="none"><path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </span>
+              </div>
             </div>
           </div>
 
           <!-- Document -->
-          <div v-else-if="msg.type === 'document'" class="msg" :class="msg.sender === 'user' ? 'msg--out' : 'msg--in'">
-            <div class="bubble" :class="msg.sender === 'user' ? 'bubble--out' : 'bubble--in'">
+          <div v-else-if="msg.type === 'document'" class="msg" :class="msg.sender === 'user' ? 'msg--in' : 'msg--out'">
+            <div class="bubble" :class="msg.sender === 'user' ? 'bubble--in' : 'bubble--out'">
               <div class="doc">
                 <div class="doc__icon">
                   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
                 </div>
                 <div class="doc__body">
                   <div class="doc__name">{{ msg.filename }}</div>
-                  <div class="doc__meta">{{ msg.filesize }} · PDF</div>
                 </div>
-                <button class="doc__dl">
+                <a v-if="msg.fileUrl" :href="msg.fileUrl" target="_blank" class="doc__dl">
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                </button>
+                </a>
               </div>
               <div class="bubble__meta">
                 <span class="bubble__time">{{ msg.time }}</span>
+                <span v-if="msg.sender === 'agent'" class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.delivered === 'read', 'bubble__ticks--delivered': msg.delivered === 'delivered' }">
+                  <svg v-if="msg.delivered === 'sent'" width="14" height="10" viewBox="0 0 14 10" fill="none"><path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <svg v-else width="14" height="10" viewBox="0 0 14 10" fill="none"><path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </span>
               </div>
             </div>
           </div>
@@ -674,11 +1009,25 @@ watch(selectedContactId, async (id) => {
       </div>
 
       <!-- Input bar -->
-      <div class="chat__input-bar">
-        <button class="input-btn">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M8 13s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
+      <input type="file" ref="fileInputRef" style="display:none" @change="handleFileUpload" accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx" />
+
+      <!-- Recording overlay -->
+      <div v-if="isRecording" class="chat__input-bar chat__input-bar--recording">
+        <button class="input-btn input-btn--cancel" @click="cancelRecording">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
-        <button class="input-btn">
+        <div class="recording-indicator">
+          <span class="recording-dot"></span>
+          <span class="recording-time">{{ formatRecordingTime(recordingDuration) }}</span>
+        </div>
+        <button class="input-btn input-btn--send" @click="stopRecording">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+      </div>
+
+      <!-- Normal input bar -->
+      <div v-else class="chat__input-bar">
+        <button class="input-btn" @click="triggerFileUpload" :disabled="sending">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
         </button>
         <div class="input-wrap">
@@ -686,16 +1035,50 @@ watch(selectedContactId, async (id) => {
             v-model="messageInput"
             type="text"
             class="input-field"
-            placeholder="Type a message"
+            :placeholder="sending ? 'Sending...' : 'Type a message'"
+            :disabled="sending"
             @keyup.enter="sendMessage"
           />
         </div>
-        <button class="input-btn input-btn--send" @click="sendMessage">
+        <!-- Show send button when there's text, mic button when empty -->
+        <button v-if="messageInput.trim()" class="input-btn input-btn--send" @click="sendMessage" :disabled="sending">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </button>
+        <button v-else class="input-btn input-btn--mic" @click="startRecording" :disabled="sending">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
         </button>
       </div>
 
     </main>
+
+    <!-- New Chat Modal -->
+    <div v-if="showNewChatModal" class="modal-overlay" @click.self="showNewChatModal = false">
+      <div class="modal">
+        <div class="modal__header">
+          <span class="modal__title">New Chat</span>
+          <button class="modal__close" @click="showNewChatModal = false">&times;</button>
+        </div>
+        <div class="modal__body">
+          <label class="modal__label">Phone number (with country code)</label>
+          <input
+            v-model="newChatPhone"
+            type="tel"
+            class="modal__input"
+            placeholder="e.g. 919876543210"
+            :disabled="newChatLoading"
+            @keyup.enter="startNewChat"
+            autofocus
+          />
+          <div v-if="newChatError" class="modal__error">{{ newChatError }}</div>
+        </div>
+        <div class="modal__footer">
+          <button class="modal__btn modal__btn--cancel" @click="showNewChatModal = false">Cancel</button>
+          <button class="modal__btn modal__btn--start" @click="startNewChat" :disabled="newChatLoading">
+            {{ newChatLoading ? 'Starting...' : 'Start Chat' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1305,6 +1688,22 @@ watch(selectedContactId, async (id) => {
   font-family: 'SF Mono', 'Fira Code', monospace;
 }
 
+/* Sender header inside user bubble */
+.bubble__sender-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 5px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+}
+
+.bubble__sender-name {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: #6366F1;
+}
+
 /* Bubble text */
 .bubble__text {
   font-size: 13px;
@@ -1335,6 +1734,10 @@ watch(selectedContactId, async (id) => {
   color: #CBD5E1;
   display: flex;
   align-items: center;
+}
+
+.bubble__ticks--delivered {
+  color: #94A3B8;
 }
 
 .bubble__ticks--read {
@@ -1418,6 +1821,14 @@ watch(selectedContactId, async (id) => {
   position: absolute;
   bottom: 6px;
   right: 8px;
+}
+
+.img-actual {
+  width: 100%;
+  max-width: 280px;
+  border-radius: 6px;
+  display: block;
+  cursor: pointer;
 }
 
 .img-caption {
@@ -1555,5 +1966,178 @@ watch(selectedContactId, async (id) => {
 .input-btn--send:hover {
   background: #2563EB;
   color: white;
+}
+
+.input-btn--send:disabled,
+.input-btn--mic:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.input-btn--mic {
+  color: #64748B;
+  border-radius: 50%;
+}
+
+.input-btn--mic:hover {
+  color: #3B82F6;
+  background: rgba(59,130,246,0.08);
+}
+
+.input-btn--cancel {
+  color: #EF4444;
+  border-radius: 50%;
+}
+
+.input-btn--cancel:hover {
+  background: rgba(239,68,68,0.08);
+}
+
+/* Recording state */
+.chat__input-bar--recording {
+  background: #FEF2F2;
+  border-top-color: #FECACA;
+}
+
+.recording-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  justify-content: center;
+}
+
+.recording-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #EF4444;
+  animation: recording-pulse 1s infinite;
+}
+
+@keyframes recording-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.recording-time {
+  font-size: 14px;
+  font-weight: 500;
+  color: #EF4444;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== NEW CHAT MODAL ===== */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal {
+  background: #fff;
+  border-radius: 12px;
+  width: 380px;
+  max-width: 90vw;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+  overflow: hidden;
+}
+
+.modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid #F0EFE9;
+}
+
+.modal__title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #1E293B;
+}
+
+.modal__close {
+  background: none;
+  border: none;
+  font-size: 22px;
+  color: #94A3B8;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+.modal__close:hover { color: #475569; }
+
+.modal__body {
+  padding: 20px;
+}
+
+.modal__label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: #64748B;
+  margin-bottom: 6px;
+}
+
+.modal__input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #E2E8F0;
+  border-radius: 8px;
+  font-size: 14px;
+  color: #1E293B;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.modal__input:focus {
+  border-color: #3B82F6;
+  box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
+}
+.modal__input:disabled {
+  opacity: 0.6;
+}
+
+.modal__error {
+  margin-top: 8px;
+  font-size: 12px;
+  color: #EF4444;
+}
+
+.modal__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px 16px;
+}
+
+.modal__btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+  transition: background 0.15s;
+}
+
+.modal__btn--cancel {
+  background: #F1F5F9;
+  color: #475569;
+}
+.modal__btn--cancel:hover { background: #E2E8F0; }
+
+.modal__btn--start {
+  background: #25D366;
+  color: #fff;
+}
+.modal__btn--start:hover { background: #20bd5a; }
+.modal__btn--start:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 </style>
