@@ -6,6 +6,14 @@ import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
 // Falls back to showing all std:wa:* instances when no agent is specified.
 const agentName = new URLSearchParams(window.location.search).get('agent') || null
 
+// ── Mobile detection ──
+const isMobile = ref(window.innerWidth <= 768)
+const mobileShowChat = ref(false)
+
+function onResize() {
+  isMobile.value = window.innerWidth <= 768
+}
+
 // ── State ──
 const activePlatform = ref('whatsapp')
 const selectedContactId = ref(null)
@@ -235,7 +243,7 @@ async function loadInstances() {
     })
 
     console.log('[channels-ui] loadInstances: loaded', contacts.value.length, 'contacts')
-    if (contacts.value.length > 0 && !selectedContactId.value) {
+    if (contacts.value.length > 0 && !selectedContactId.value && !isMobile.value) {
       selectedContactId.value = contacts.value[0].id
     }
   } catch (e) {
@@ -468,8 +476,13 @@ const scrollToBottom = () => {
 const selectContact = async (id) => {
   selectedContactId.value = id
   showTyping.value = false
+  if (isMobile.value) mobileShowChat.value = true
   await loadMessages(id)
   scrollToBottom()
+}
+
+const mobileBack = () => {
+  mobileShowChat.value = false
 }
 
 const openNewChat = () => {
@@ -711,6 +724,7 @@ const formatRecordingTime = (seconds) => {
 let _pollInterval = null
 
 onMounted(async () => {
+  window.addEventListener('resize', onResize)
   await ensureAuth()
   await loadInstances()
   if (selectedContactId.value) {
@@ -727,6 +741,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (_pollInterval) clearInterval(_pollInterval)
+  window.removeEventListener('resize', onResize)
 })
 
 watch(selectedContactId, async (id) => {
@@ -738,17 +753,17 @@ watch(selectedContactId, async (id) => {
 </script>
 
 <template>
-  <div class="app">
+  <div class="app" :class="{ 'app--mobile': isMobile }">
 
     <!-- ===== SIDEBAR ===== -->
-    <aside class="sidebar">
+    <aside class="sidebar" :class="{ 'sidebar--hidden': isMobile && mobileShowChat }">
       <!-- Header -->
       <div class="sidebar__header">
         <div class="sidebar__brand">
           <div class="sidebar__brand-icon">
             <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421-12.421a9.965 9.965 0 00-5.384 1.562L3.6 3.6l-.563 3.067A9.965 9.965 0 002 12c0 5.523 4.477 10 10 10s10-4.477 10-10S17.523 2 12 2c-.018 0-.036.001-.054.001a9.99 9.99 0 00-.895-.04z"/></svg>
           </div>
-          <span class="sidebar__brand-name">Channels</span>
+          <span class="sidebar__brand-name">WhatsApp</span>
         </div>
         <div class="sidebar__header-actions">
           <button class="sidebar__icon-btn" @click="openNewChat" title="New chat">
@@ -757,8 +772,8 @@ watch(selectedContactId, async (id) => {
         </div>
       </div>
 
-      <!-- Platform tabs -->
-      <div class="sidebar__tabs">
+      <!-- Platform tabs (only WhatsApp active for now) -->
+      <!-- <div class="sidebar__tabs">
         <button
           v-for="p in platforms"
           :key="p.id"
@@ -768,7 +783,7 @@ watch(selectedContactId, async (id) => {
           <svg class="sidebar__tab-icon" width="13" height="13" viewBox="0 0 24 24" :fill="p.id === 'email' ? 'currentColor' : 'none'" :stroke="p.id === 'email' ? 'none' : 'currentColor'" stroke-width="1.5"><path :d="p.icon"/></svg>
           {{ p.label }}
         </button>
-      </div>
+      </div> -->
 
       <!-- Search -->
       <div class="sidebar__search">
@@ -835,12 +850,17 @@ watch(selectedContactId, async (id) => {
     </aside>
 
     <!-- ===== CHAT ===== -->
-    <main class="chat" v-if="selectedContact">
+    <main class="chat" :class="{ 'chat--visible': !isMobile || mobileShowChat }" v-if="selectedContact || (isMobile && mobileShowChat)">
 
       <!-- Chat header -->
       <div class="chat__header">
         <div class="chat__header-left">
-          <div class="chat__avatar" :style="{ background: selectedContact.color }">
+          <button v-if="isMobile" class="chat__back-btn" @click="mobileBack">
+            <svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+            </svg>
+          </button>
+          <div class="chat__avatar" :style="{ background: selectedContact?.color }">
             {{ selectedContact.name[0] }}
             <div v-if="selectedContact.online" class="chat__avatar-online"></div>
           </div>
@@ -2139,5 +2159,86 @@ watch(selectedContactId, async (id) => {
 .modal__btn--start:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* ===== MOBILE RESPONSIVENESS ===== */
+
+.chat__back-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  color: #64748B;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.chat__back-btn:hover {
+  background: rgba(0,0,0,0.04);
+}
+
+/* On mobile the chat panel is hidden by default, visible when a contact is tapped */
+.chat--visible {
+  /* only used for mobile logic via JS class binding */
+}
+
+@media (max-width: 768px) {
+  .app {
+    flex-direction: column;
+    position: relative;
+  }
+
+  .sidebar {
+    width: 100%;
+    height: 100vh;
+    flex-shrink: 0;
+    border-right: none;
+  }
+
+  .sidebar--hidden {
+    display: none;
+  }
+
+  .chat {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: 100vh;
+    z-index: 10;
+    display: none;
+  }
+
+  .chat--visible {
+    display: flex;
+  }
+
+  .chat__messages {
+    padding: 12px 4%;
+  }
+
+  .bubble {
+    max-width: 80%;
+  }
+
+  .chat__input-bar {
+    padding: 8px 10px 12px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .chat__header {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+
+  .sidebar__header {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
 }
 </style>
