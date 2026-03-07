@@ -5,6 +5,7 @@ const FRAPPE_PORT = process.env.VITE_FRAPPE_PORT || '8001'
 const FRAPPE_HOST = process.env.VITE_FRAPPE_HOST || 'dev.localhost'
 
 export default defineConfig({
+  base: './',
   plugins: [vue()],
   server: {
     port: 5174,

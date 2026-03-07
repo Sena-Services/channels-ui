@@ -97,59 +97,28 @@ async function frappe(method, params = {}) {
 async function ensureAuth() {
   console.log('[channels-ui] ensureAuth: start, _sid =', _sid ? _sid.slice(0, 12) + '...' : null)
 
-  // Step 1: if we already have a sid, verify it's still valid
-  if (_sid) {
-    try {
-      const resp = await fetch('/api/method/sena_agents_backend.sena_agents_backend.api.auth.get_csrf_token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ sid: _sid }),
-      })
-      if (resp.ok) {
-        const data = await resp.json()
-        if (data.message?.user && data.message.user !== 'Guest') {
-          if (data.message?.csrf_token) _csrfToken = data.message.csrf_token
-          console.log('[channels-ui] ensureAuth: existing sid valid, user =', data.message.user)
-          return
-        }
-      }
-    } catch {}
-    _sid = null
-  }
-
-  // Step 2: login — proxy exposes sid via x-frappe-sid response header
-  console.log('[channels-ui] ensureAuth: logging in...')
+  // Same-origin iframe shares cookies with the parent app.
+  // Use GET to avoid CSRF chicken-and-egg — browser sends the session cookie automatically.
   try {
-    const loginResp = await fetch('/api/method/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    const url = '/api/method/sena_agents_backend.sena_agents_backend.api.auth.get_csrf_token'
+      + (_sid ? `?sid=${encodeURIComponent(_sid)}` : '')
+    const resp = await fetch(url, {
+      method: 'GET',
       credentials: 'include',
-      body: JSON.stringify({ usr: 'Administrator', pwd: 'Admin123' }),
     })
-    const loginData = await loginResp.json()
-    console.log('[channels-ui] ensureAuth: login', loginResp.status, loginData?.message)
-
-    // The vite proxy sets x-frappe-sid so JS can read it (bypasses HttpOnly + cookie blocking)
-    const sid = loginResp.headers.get('x-frappe-sid')
-    console.log('[channels-ui] ensureAuth: x-frappe-sid =', sid ? sid.slice(0, 12) + '...' : null)
-    if (sid) _sid = sid
-
-    // Step 3: get CSRF token with the new sid
-    const csrfResp = await fetch('/api/method/sena_agents_backend.sena_agents_backend.api.auth.get_csrf_token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ sid: _sid }),
-    })
-    if (csrfResp.ok) {
-      const data = await csrfResp.json()
-      console.log('[channels-ui] ensureAuth: user after login =', data.message?.user)
-      if (data.message?.csrf_token) _csrfToken = data.message.csrf_token
+    if (resp.ok) {
+      const data = await resp.json()
+      if (data.message?.user && data.message.user !== 'Guest') {
+        if (data.message?.csrf_token) _csrfToken = data.message.csrf_token
+        console.log('[channels-ui] ensureAuth: authed via cookie, user =', data.message.user)
+        return
+      }
     }
   } catch (e) {
-    console.warn('[channels-ui] ensureAuth: login failed', e)
+    console.warn('[channels-ui] ensureAuth: csrf fetch failed', e)
   }
+
+  console.warn('[channels-ui] ensureAuth: no valid session — user must log in via the main app')
 }
 
 // ── Format helpers ──
