@@ -39,6 +39,7 @@ const messageFilter = ref('all') // 'all' | 'customer' | 'internal'
 let _mediaRecorder = null
 let _audioChunks = []
 let _recordingTimer = null
+let _uiAgents = null // cached list of agent names sharing this UI
 
 // ── Data ──
 const contacts = ref([])
@@ -219,8 +220,22 @@ async function loadInstances(silent = false) {
   if (!silent) error.value = null
   console.log('[channels-ui] loadInstances: start, agentName =', agentName, 'silent =', silent)
   try {
+    // Find all agents sharing this UI, then show all their WhatsApp instances
+    if (!_uiAgents) {
+      try {
+        const agents = await frappe('frappe.client.get_list', {
+          doctype: 'Runtime Agent',
+          filters: [['ui_iframe_url', 'like', '%whatsapp-channels%'], ['enabled', '=', 1]],
+          fields: ['agent_name'],
+          limit_page_length: 100,
+        })
+        _uiAgents = (agents || []).map(a => a.agent_name)
+      } catch (e) {
+        _uiAgents = agentName ? [agentName] : []
+      }
+    }
     const filters = [['instance_id', 'like', 'std:wa:%']]
-    if (agentName) filters.push(['agent_name', '=', agentName])
+    if (_uiAgents.length > 0) filters.push(['agent_name', 'in', _uiAgents])
 
     const rows = await frappe('frappe.client.get_list', {
       doctype: 'Runtime Instance',
@@ -480,6 +495,41 @@ async function loadMessages(instanceName, silent = false) {
       }
     }
 
+    // ── Group consecutive internal messages into single dashed boxes ──
+    // Internal = agent_note OR system/approval messages (operator_instruction with [System]/[Approval prefix)
+    const isInternal = (m) => {
+      if (m.type === 'date') return false
+      if (m.msgType === 'agent_note') return true
+      if (m.msgType === 'operator_instruction' && /^\[System\]|\[Approval/.test(m.text)) return true
+      return false
+    }
+    const grouped = []
+    for (let i = 0; i < uiMsgs.length; i++) {
+      const msg = uiMsgs[i]
+      if (!isInternal(msg)) { grouped.push(msg); continue }
+      // Start a group — collect consecutive internal messages
+      const parts = [msg]
+      while (i + 1 < uiMsgs.length && isInternal(uiMsgs[i + 1])) {
+        i++
+        parts.push(uiMsgs[i])
+      }
+      if (parts.length === 1) { grouped.push(msg); continue }
+      // Merge into one message: store parts array for stepped rendering
+      const approvalPart = parts.find(p => p.approvalId)
+      const agentPart = parts.find(p => p.msgType === 'agent_note')
+      grouped.push({
+        ...parts[0],
+        text: parts[0].text, // fallback for renderText
+        _parts: parts.map(p => p.text), // individual step texts
+        time: parts[parts.length - 1].time,
+        approvalId: approvalPart?.approvalId || null,
+        approvalStatus: approvalPart?.approvalStatus || null,
+        approvalNote: approvalPart?.approvalNote || '',
+        agentName: agentPart?.agentName || parts[0].agentName,
+        msgType: 'agent_note', // grouped internals render as agent note (left dashed)
+      })
+    }
+
     // Update contact's lastMsg with last meaningful message (skip [System] noise)
     const reversed = [...(rows || [])].reverse()
     const lastMeaningful = reversed.find(r => {
@@ -501,9 +551,9 @@ async function loadMessages(instanceName, silent = false) {
     }
 
     const prevCount = messagesCache.value[instanceName]?.length || 0
-    messagesCache.value[instanceName] = uiMsgs
+    messagesCache.value[instanceName] = grouped
     // Auto-scroll if new messages arrived
-    if (uiMsgs.length > prevCount && instanceName === selectedContactId.value) {
+    if (grouped.length > prevCount && instanceName === selectedContactId.value) {
       scrollToBottom()
     }
   } catch (e) {
@@ -650,8 +700,17 @@ const startNewChat = async () => {
   }
 }
 
-async function deleteChat(instanceId) {
-  if (!confirm('Delete this conversation? This cannot be undone.')) return
+const pendingDeleteId = ref(null)
+
+function deleteChat(instanceId) {
+  // First call → show confirmation; second call (from confirm button) → execute
+  pendingDeleteId.value = instanceId
+}
+
+async function confirmDeleteChat() {
+  const instanceId = pendingDeleteId.value
+  pendingDeleteId.value = null
+  if (!instanceId) return
   try {
     await frappe('frappe.client.delete', { doctype: 'Runtime Instance', name: instanceId })
     // Remove from local state
@@ -663,7 +722,6 @@ async function deleteChat(instanceId) {
     }
   } catch (e) {
     console.error('[channels-ui] deleteChat failed:', e)
-    alert('Failed to delete: ' + e.message)
   }
 }
 
@@ -1113,6 +1171,17 @@ watch(selectedContactId, async (id) => {
       </div>
     </aside>
 
+    <!-- Delete confirmation overlay -->
+    <div v-if="pendingDeleteId" class="confirm-overlay" @click="pendingDeleteId = null">
+      <div class="confirm-dialog" @click.stop>
+        <p class="confirm-dialog__text">Delete this conversation? This cannot be undone.</p>
+        <div class="confirm-dialog__btns">
+          <button class="confirm-dialog__btn confirm-dialog__btn--cancel" @click="pendingDeleteId = null">Cancel</button>
+          <button class="confirm-dialog__btn confirm-dialog__btn--delete" @click="confirmDeleteChat">Delete</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ===== CHAT ===== -->
     <main class="chat" :class="{ 'chat--visible': !isMobile || mobileShowChat }" v-if="selectedContact || (isMobile && mobileShowChat)">
 
@@ -1195,12 +1264,18 @@ watch(selectedContactId, async (id) => {
 
           <!-- Internal message (dashed) — operator instructions right, agent notes left -->
           <div v-else-if="(msg.type === 'text' && msg.msgType === 'operator_instruction') || (msg.type === 'agent' && msg.msgType === 'agent_note')" class="msg" :class="msg.msgType === 'operator_instruction' ? 'msg--out' : 'msg--in'">
-            <div class="internal-msg">
-              <div class="internal-msg__text" v-html="renderText(msg.text)"></div>
-              <div class="internal-msg__meta">
-                <span class="internal-msg__who">{{ msg.msgType === 'operator_instruction' ? 'you' : msg.agentName || 'agent' }}</span>
-                <span class="internal-msg__time">{{ msg.time }}</span>
-              </div>
+            <div class="msg__wrapper">
+              <span class="msg__sender-label" :class="msg.msgType === 'operator_instruction' ? 'msg__sender-label--agent' : ''">{{ msg.msgType === 'operator_instruction' ? 'You' : msg.agentName || 'Agent' }}</span>
+              <div class="internal-msg">
+                <!-- Grouped steps -->
+                <ol v-if="msg._parts && msg._parts.length > 1" class="internal-msg__steps">
+                  <li v-for="(part, idx) in msg._parts" :key="idx" class="internal-msg__step" v-html="renderText(part)"></li>
+                </ol>
+                <!-- Single message -->
+                <div v-else class="internal-msg__text" v-html="renderText(msg.text)"></div>
+                <div class="internal-msg__meta">
+                  <span class="internal-msg__time">{{ msg.time }}</span>
+                </div>
               <!-- Approval actions if present -->
               <div v-if="msg.approvalId && msg.approvalStatus === 'pending'" class="internal-msg__approval">
                 <input v-model="msg.approvalNote" class="approval-note-input" type="text" placeholder="Note (optional)..." @click.stop @keydown.enter.stop="handleApprove(msg)" />
@@ -1225,6 +1300,7 @@ watch(selectedContactId, async (id) => {
                 <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View →</button>
               </div>
               <div v-else-if="msg.approvalId && (msg.approvalStatus === 'approving' || msg.approvalStatus === 'rejecting')" class="internal-msg__approval-status">{{ msg.approvalStatus }}...</div>
+              </div>
             </div>
           </div>
 
@@ -3099,6 +3175,25 @@ watch(selectedContactId, async (id) => {
   word-break: break-word;
 }
 
+.internal-msg__steps {
+  margin: 0;
+  padding: 0 0 0 18px;
+  font-size: 12px;
+  color: #64748B;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.internal-msg__step {
+  padding: 2px 0;
+}
+
+.internal-msg__step + .internal-msg__step {
+  border-top: 1px dashed rgba(0, 0, 0, 0.06);
+  margin-top: 4px;
+  padding-top: 6px;
+}
+
 .internal-msg__meta {
   display: flex;
   align-items: center;
@@ -3207,5 +3302,65 @@ watch(selectedContactId, async (id) => {
   .sidebar__header {
     padding-top: env(safe-area-inset-top, 0px);
   }
+}
+
+/* ===== DELETE CONFIRMATION ===== */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.confirm-dialog {
+  background: #fff;
+  border-radius: 12px;
+  padding: 20px 24px;
+  max-width: 320px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.15);
+}
+
+.confirm-dialog__text {
+  margin: 0 0 16px;
+  font-size: 13px;
+  color: #1E293B;
+  line-height: 1.5;
+}
+
+.confirm-dialog__btns {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.confirm-dialog__btn {
+  padding: 6px 16px;
+  border-radius: 6px;
+  border: none;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.confirm-dialog__btn--cancel {
+  background: #F1F5F9;
+  color: #64748B;
+}
+
+.confirm-dialog__btn--cancel:hover {
+  background: #E2E8F0;
+}
+
+.confirm-dialog__btn--delete {
+  background: #EF4444;
+  color: #fff;
+}
+
+.confirm-dialog__btn--delete:hover {
+  background: #DC2626;
 }
 </style>

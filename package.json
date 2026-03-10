@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "deploy": "vite build && cp -r dist/* ../senaBench/apps/dev_custom_app/dev_custom_app/public/whatsapp-channels/",
     "preview": "vite preview"
   },
   "dependencies": {
