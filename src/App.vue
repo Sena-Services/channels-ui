@@ -6,8 +6,16 @@ import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
 // Falls back to showing all std:wa:* instances when no agent is specified.
 const agentName = new URLSearchParams(window.location.search).get('agent') || null
 
+// ── Mobile detection ──
+const isMobile = ref(window.innerWidth <= 768)
+const mobileShowChat = ref(false)
+
+function onResize() {
+  isMobile.value = window.innerWidth <= 768
+}
+
 // ── State ──
-const activePlatform = ref('whatsapp')
+const activePlatforms = ref(new Set(['whatsapp']))
 const selectedContactId = ref(null)
 const messageInput = ref('')
 const messageListRef = ref(null)
@@ -23,7 +31,11 @@ const showNewChatModal = ref(false)
 const newChatPhone = ref('')
 const newChatLoading = ref(false)
 const newChatError = ref('')
+const newChatAgents = ref([])       // list of {name, default, phones}
+const newChatSelectedAgent = ref('') // selected agent name
 const searchQuery = ref('')
+const sendMode = ref('customer') // 'customer' | 'agent'
+const messageFilter = ref('all') // 'all' | 'customer' | 'internal'
 let _mediaRecorder = null
 let _audioChunks = []
 let _recordingTimer = null
@@ -34,11 +46,35 @@ const messagesCache = ref({}) // instanceName → array of UI message objects
 
 const avatarColors = ['#3B82F6', '#8B5CF6', '#EC4899', '#F59E0B', '#10B981', '#06B6D4', '#EF4444', '#6366F1']
 
-const platforms = [
-  { id: 'whatsapp', label: 'WhatsApp', icon: 'M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347' },
-  { id: 'instagram', label: 'Instagram', icon: 'M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zM12 0C8.741 0 8.333.014 7.053.072 2.695.272.273 2.69.073 7.052.014 8.333 0 8.741 0 12c0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98C8.333 23.986 8.741 24 12 24c3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98C15.668.014 15.259 0 12 0zm0 5.838a6.162 6.162 0 100 12.324 6.162 6.162 0 000-12.324zM12 16a4 4 0 110-8 4 4 0 010 8zm6.406-11.845a1.44 1.44 0 100 2.881 1.44 1.44 0 000-2.881z' },
-  { id: 'email', label: 'Email', icon: 'M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z' },
+const channels = [
+  { id: 'whatsapp', label: 'WhatsApp', color: '#25D366', icon: 'M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z' },
+  { id: 'instagram', label: 'Instagram', color: '#E4405F', icon: 'M12 2.163c3.204 0 3.584.012 4.85.07 3.252.148 4.771 1.691 4.919 4.919.058 1.265.069 1.645.069 4.849 0 3.205-.012 3.584-.069 4.849-.149 3.225-1.664 4.771-4.919 4.919-1.266.058-1.644.07-4.85.07-3.204 0-3.584-.012-4.849-.07-3.26-.149-4.771-1.699-4.919-4.92-.058-1.265-.07-1.644-.07-4.849 0-3.204.013-3.583.07-4.849.149-3.227 1.664-4.771 4.919-4.919 1.266-.057 1.645-.069 4.849-.069zM12 0C8.741 0 8.333.014 7.053.072 2.695.272.273 2.69.073 7.052.014 8.333 0 8.741 0 12c0 3.259.014 3.668.072 4.948.2 4.358 2.618 6.78 6.98 6.98C8.333 23.986 8.741 24 12 24c3.259 0 3.668-.014 4.948-.072 4.354-.2 6.782-2.618 6.979-6.98.059-1.28.073-1.689.073-4.948 0-3.259-.014-3.667-.072-4.947-.196-4.354-2.617-6.78-6.979-6.98C15.668.014 15.259 0 12 0zm0 5.838a6.162 6.162 0 100 12.324 6.162 6.162 0 000-12.324zM12 16a4 4 0 110-8 4 4 0 010 8zm6.406-11.845a1.44 1.44 0 100 2.881 1.44 1.44 0 000-2.881z' },
+  { id: 'telegram', label: 'Telegram', color: '#26A5E4', icon: 'M11.944 0A12 12 0 000 12a12 12 0 0012 12 12 12 0 0012-12A12 12 0 0012 0a12 12 0 00-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 01.171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.479.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z' },
+  { id: 'slack', label: 'Slack', color: '#4A154B', icon: 'M5.042 15.165a2.528 2.528 0 01-2.52 2.523A2.528 2.528 0 010 15.165a2.527 2.527 0 012.522-2.52h2.52v2.52zm1.271 0a2.527 2.527 0 012.521-2.52 2.527 2.527 0 012.521 2.52v6.313A2.528 2.528 0 018.834 24a2.528 2.528 0 01-2.521-2.522v-6.313zM8.834 5.042a2.528 2.528 0 01-2.521-2.52A2.528 2.528 0 018.834 0a2.528 2.528 0 012.521 2.522v2.52H8.834zm0 1.271a2.528 2.528 0 012.521 2.521 2.528 2.528 0 01-2.521 2.521H2.522A2.528 2.528 0 010 8.834a2.528 2.528 0 012.522-2.521h6.312zM18.956 8.834a2.528 2.528 0 012.522-2.521A2.528 2.528 0 0124 8.834a2.528 2.528 0 01-2.522 2.521h-2.522V8.834zm-1.27 0a2.528 2.528 0 01-2.523 2.521 2.527 2.527 0 01-2.52-2.521V2.522A2.527 2.527 0 0115.163 0a2.528 2.528 0 012.523 2.522v6.312zM15.163 18.956a2.528 2.528 0 012.523 2.522A2.528 2.528 0 0115.163 24a2.527 2.527 0 01-2.52-2.522v-2.522h2.52zm0-1.27a2.527 2.527 0 01-2.52-2.523 2.527 2.527 0 012.52-2.52h6.315A2.528 2.528 0 0124 15.163a2.528 2.528 0 01-2.522 2.523h-6.315z' },
+  { id: 'twitter', label: 'X / Twitter', color: '#000000', icon: 'M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z' },
+  { id: 'email', label: 'Email', color: '#EA4335', icon: 'M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z' },
+  { id: 'teams', label: 'Teams', color: '#6264A7', icon: 'M19.098 7.753h-3.82v9.537c0 2.379-1.932 4.31-4.312 4.31a4.278 4.278 0 01-2.26-.641A6.46 6.46 0 0014.363 24c3.569 0 6.46-2.892 6.46-6.46V9.478a1.725 1.725 0 00-1.725-1.725zM16.5 6a2.5 2.5 0 100-5 2.5 2.5 0 000 5zm-5.5.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7zm4.076 2.253H5.424A1.424 1.424 0 004 10.177v6.345a5 5 0 0010 0v-6.345a1.424 1.424 0 00-1.424-1.424z' },
 ]
+
+function togglePlatform(id) {
+  const s = new Set(activePlatforms.value)
+  if (s.has(id)) {
+    s.delete(id)
+  } else {
+    s.add(id)
+  }
+  activePlatforms.value = s
+}
+
+function toggleAllPlatforms() {
+  if (activePlatforms.value.size === channels.length) {
+    activePlatforms.value = new Set()
+  } else {
+    activePlatforms.value = new Set(channels.map(c => c.id))
+  }
+}
+
+const allSelected = computed(() => activePlatforms.value.size === channels.length)
 
 const statusConfig = {
   default: { color: '#64748B', bg: 'rgba(100,116,139,0.08)' },
@@ -89,59 +125,60 @@ async function frappe(method, params = {}) {
 async function ensureAuth() {
   console.log('[channels-ui] ensureAuth: start, _sid =', _sid ? _sid.slice(0, 12) + '...' : null)
 
-  // Step 1: if we already have a sid, verify it's still valid
-  if (_sid) {
-    try {
-      const resp = await fetch('/api/method/sena_agents_backend.sena_agents_backend.api.auth.get_csrf_token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ sid: _sid }),
-      })
-      if (resp.ok) {
-        const data = await resp.json()
-        if (data.message?.user && data.message.user !== 'Guest') {
-          if (data.message?.csrf_token) _csrfToken = data.message.csrf_token
-          console.log('[channels-ui] ensureAuth: existing sid valid, user =', data.message.user)
-          return
-        }
-      }
-    } catch {}
-    _sid = null
-  }
-
-  // Step 2: login — proxy exposes sid via x-frappe-sid response header
-  console.log('[channels-ui] ensureAuth: logging in...')
+  // Same-origin iframe shares cookies with the parent app.
+  // Use GET to avoid CSRF chicken-and-egg — browser sends the session cookie automatically.
   try {
-    const loginResp = await fetch('/api/method/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    const url = '/api/method/sena_agents_backend.sena_agents_backend.api.auth.get_csrf_token'
+      + (_sid ? `?sid=${encodeURIComponent(_sid)}` : '')
+    const resp = await fetch(url, {
+      method: 'GET',
       credentials: 'include',
-      body: JSON.stringify({ usr: 'Administrator', pwd: 'Admin123' }),
     })
-    const loginData = await loginResp.json()
-    console.log('[channels-ui] ensureAuth: login', loginResp.status, loginData?.message)
-
-    // The vite proxy sets x-frappe-sid so JS can read it (bypasses HttpOnly + cookie blocking)
-    const sid = loginResp.headers.get('x-frappe-sid')
-    console.log('[channels-ui] ensureAuth: x-frappe-sid =', sid ? sid.slice(0, 12) + '...' : null)
-    if (sid) _sid = sid
-
-    // Step 3: get CSRF token with the new sid
-    const csrfResp = await fetch('/api/method/sena_agents_backend.sena_agents_backend.api.auth.get_csrf_token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify({ sid: _sid }),
-    })
-    if (csrfResp.ok) {
-      const data = await csrfResp.json()
-      console.log('[channels-ui] ensureAuth: user after login =', data.message?.user)
-      if (data.message?.csrf_token) _csrfToken = data.message.csrf_token
+    if (resp.ok) {
+      const data = await resp.json()
+      if (data.message?.user && data.message.user !== 'Guest') {
+        if (data.message?.csrf_token) _csrfToken = data.message.csrf_token
+        console.log('[channels-ui] ensureAuth: authed via cookie, user =', data.message.user)
+        return
+      }
     }
   } catch (e) {
-    console.warn('[channels-ui] ensureAuth: login failed', e)
+    console.warn('[channels-ui] ensureAuth: csrf fetch failed', e)
   }
+
+  // Dev mode fallback: auto-login with dev credentials when running standalone
+  if (window.location.port === '5174') {
+    console.log('[channels-ui] ensureAuth: dev mode — attempting auto-login')
+    try {
+      // Use form-encoded POST to avoid CSRF requirement
+      const loginResp = await fetch('/api/method/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+        credentials: 'include',
+        body: 'usr=Administrator&pwd=Admin123',
+      })
+      if (loginResp.ok) {
+        // Extract sid from x-frappe-sid header (exposed by vite proxy)
+        const sid = loginResp.headers.get('x-frappe-sid')
+        if (sid) _sid = sid
+        // Get CSRF from the HTML page (Frappe embeds it as frappe.csrf_token)
+        const pageResp = await fetch('/', { credentials: 'include' })
+        if (pageResp.ok) {
+          const html = await pageResp.text()
+          const csrfMatch = html.match(/frappe\.csrf_token\s*=\s*"([^"]+)"/)
+          if (csrfMatch && csrfMatch[1] !== 'None') _csrfToken = csrfMatch[1]
+        }
+        console.log('[channels-ui] ensureAuth: dev auto-login success, sid =', _sid ? _sid.slice(0, 12) + '...' : null)
+        return
+      } else {
+        console.warn('[channels-ui] ensureAuth: dev login failed with status', loginResp.status)
+      }
+    } catch (e) {
+      console.warn('[channels-ui] ensureAuth: dev auto-login failed', e)
+    }
+  }
+
+  console.warn('[channels-ui] ensureAuth: no valid session — user must log in via the main app')
 }
 
 // ── Format helpers ──
@@ -177,10 +214,10 @@ function avatarColor(str, idx) {
 }
 
 // ── Load instances (sidebar contacts) ──
-async function loadInstances() {
-  loading.value = true
-  error.value = null
-  console.log('[channels-ui] loadInstances: start, agentName =', agentName)
+async function loadInstances(silent = false) {
+  if (!silent) loading.value = true
+  if (!silent) error.value = null
+  console.log('[channels-ui] loadInstances: start, agentName =', agentName, 'silent =', silent)
   try {
     const filters = [['instance_id', 'like', 'std:wa:%']]
     if (agentName) filters.push(['agent_name', '=', agentName])
@@ -193,29 +230,39 @@ async function loadInstances() {
       limit_page_length: 50,
     })
 
-    // Fetch the latest sender_name for each instance (from the most recent user message)
+    // Fetch the latest sender_name for each instance (skip during silent poll — too expensive)
     const senderNames = {}
-    for (const row of (rows || [])) {
-      try {
-        const userMsgs = await frappe('frappe.client.get_list', {
-          doctype: 'Runtime Message',
-          filters: [['instance', '=', row.name], ['role', '=', 'user'], ['sender_name', 'is', 'set']],
-          fields: ['sender_name'],
-          order_by: 'creation desc',
-          limit_page_length: 1,
-        })
-        if (userMsgs && userMsgs.length > 0 && userMsgs[0].sender_name) {
-          senderNames[row.name] = userMsgs[0].sender_name
+    if (!silent) {
+      for (const row of (rows || [])) {
+        try {
+          const userMsgs = await frappe('frappe.client.get_list', {
+            doctype: 'Runtime Message',
+            filters: [['instance', '=', row.name], ['role', '=', 'user'], ['sender_name', 'is', 'set']],
+            fields: ['sender_name'],
+            order_by: 'creation desc',
+            limit_page_length: 1,
+          })
+          if (userMsgs && userMsgs.length > 0 && userMsgs[0].sender_name) {
+            senderNames[row.name] = userMsgs[0].sender_name
+          }
+        } catch (e) {
+          console.warn('[channels-ui] Failed to fetch sender_name for', row.name, e)
         }
-      } catch (e) {
-        console.warn('[channels-ui] Failed to fetch sender_name for', row.name, e)
       }
     }
-    console.log('[channels-ui] senderNames:', senderNames)
+    if (!silent) console.log('[channels-ui] senderNames:', senderNames)
+
+    // During silent poll, preserve existing contact names
+    const existingNames = {}
+    if (silent) {
+      for (const c of contacts.value) existingNames[c.id] = c.name
+    }
 
     contacts.value = (rows || []).map((row, idx) => {
       const phone = formatPhone(row.instance_id)
-      const displayName = senderNames[row.name] || phone
+      // Prefer sender_name from messages, then instance title (updated by webhook), then phone
+      const titleName = (row.title && !row.title.startsWith('WhatsApp: +') && row.title !== phone) ? row.title : ''
+      const displayName = senderNames[row.name] || existingNames[row.name] || titleName || phone
       return {
         id: row.name,           // instance name (doc id)
         instanceId: row.instance_id,
@@ -235,14 +282,14 @@ async function loadInstances() {
     })
 
     console.log('[channels-ui] loadInstances: loaded', contacts.value.length, 'contacts')
-    if (contacts.value.length > 0 && !selectedContactId.value) {
+    if (contacts.value.length > 0 && !selectedContactId.value && !isMobile.value) {
       selectedContactId.value = contacts.value[0].id
     }
   } catch (e) {
-    console.error('[channels-ui] loadInstances FAILED:', e?.message || e)
-    error.value = 'Could not load conversations. Make sure you are logged into Sena.'
+    if (!silent) console.error('[channels-ui] loadInstances FAILED:', e?.message || e)
+    if (!silent) error.value = 'Could not load conversations. Make sure you are logged into Sena.'
   } finally {
-    loading.value = false
+    if (!silent) loading.value = false
   }
 }
 
@@ -253,16 +300,20 @@ async function loadMessages(instanceName, silent = false) {
   }
   if (!silent) loadingMessages.value = true
   try {
-    const rows = await frappe('frappe.client.get_list', {
-      doctype: 'Runtime Message',
-      filters: [['instance', '=', instanceName]],
-      fields: ['name', 'role', 'content', 'tool_calls', 'creation', 'sender_name', 'message_status', 'attachments'],
-      order_by: 'creation asc',
-      limit_page_length: 200,
-    })
-
     const contact = contacts.value.find(c => c.id === instanceName)
-    const agentName = contact?.agentName || 'Agent'
+    // Use the memory API which decrypts encrypted content server-side
+    const result = await frappe('sena_agents_backend.sena_agents_backend.api.memory.get_messages', {
+      agent_name: contact?.agentName || agentName || '',
+      instance_id: contact?.instanceId || instanceName,
+      limit: 200,
+    })
+    const rows = (result?.messages || []).map(m => ({
+      ...m,
+      creation: m.timestamp,
+      tool_calls: m.tool_calls ? JSON.stringify(m.tool_calls) : null,
+      attachments: m.attachments ? JSON.stringify(m.attachments) : null,
+    }))
+    const displayAgentName = contact?.agentName || 'Agent'
 
     const uiMsgs = []
     let lastDateLabel = null
@@ -284,6 +335,7 @@ async function loadMessages(instanceName, silent = false) {
         // "actual message\n---\n[WhatsApp from name] IMPORTANT: ..."
         const rawText = row.content || ''
         const cleanText = rawText.split('\n---\n')[0].replace(/\s*\[WhatsApp from[^\]]*\].*$/s, '').trim()
+        const isOperatorInstruction = row.sender_name === 'Operator' || (!rawText.includes('[WhatsApp from'))
         uiMsgs.push({
           id: row.name,
           type: 'text',
@@ -292,6 +344,7 @@ async function loadMessages(instanceName, silent = false) {
           time: timeStr,
           read: true,
           senderName: row.sender_name || '',
+          msgType: isOperatorInstruction ? 'operator_instruction' : 'customer_in',
         })
       } else if (row.role === 'assistant') {
         let toolLabel = null
@@ -326,6 +379,9 @@ async function loadMessages(instanceName, silent = false) {
         // null = pre-tracking message (assume delivered), otherwise use DB value
         const deliveryStatus = row.message_status || 'delivered'
 
+        // Determine operator vs agent sender
+        const isOperatorSender = row.sender_name === 'Operator'
+
         // If message has attachments, render as media
         if (attachments && attachments.length > 0) {
           const att = attachments[0]
@@ -339,8 +395,9 @@ async function loadMessages(instanceName, silent = false) {
               caption: caption || null,
               sender: 'agent',
               time: timeStr,
-              senderName: row.sender_name || agentName,
+              senderName: row.sender_name || displayAgentName,
               delivered: deliveryStatus,
+              msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
             })
           } else if (mime.startsWith('audio/')) {
             uiMsgs.push({
@@ -350,8 +407,9 @@ async function loadMessages(instanceName, silent = false) {
               text: caption || null,
               sender: 'agent',
               time: timeStr,
-              senderName: row.sender_name || agentName,
+              senderName: row.sender_name || displayAgentName,
               delivered: deliveryStatus,
+              msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
             })
           } else {
             uiMsgs.push({
@@ -361,8 +419,9 @@ async function loadMessages(instanceName, silent = false) {
               fileUrl: att.file_url,
               sender: 'agent',
               time: timeStr,
-              senderName: row.sender_name || agentName,
+              senderName: row.sender_name || displayAgentName,
               delivered: deliveryStatus,
+              msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
             })
           }
           continue
@@ -376,10 +435,11 @@ async function loadMessages(instanceName, silent = false) {
             sender: 'agent',
             time: timeStr,
             isAI: true,
-            agentName,
+            agentName: displayAgentName,
             agentTool: toolLabel || null,
-            senderName: row.sender_name || agentName,
+            senderName: row.sender_name || displayAgentName,
             delivered: deliveryStatus,
+            msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
           })
         } else if (sentVoice) {
           uiMsgs.push({
@@ -389,12 +449,16 @@ async function loadMessages(instanceName, silent = false) {
             sender: 'agent',
             time: timeStr,
             isAI: true,
-            agentName,
-            senderName: row.sender_name || agentName,
+            agentName: displayAgentName,
+            senderName: row.sender_name || displayAgentName,
             delivered: deliveryStatus,
+            msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
           })
         } else if (row.content) {
-          // Fallback: show agent content if no WA send tool was called
+          // Fallback: show agent content if no WA send tool was called — this is an agent note
+          // Check for pending approval ID in the message
+          const approvalMatch = row.content.match(/(?:awaiting\s+(?:human\s+)?approval|approval\s+(?:id|ID))[^a-z0-9]*\(?(?:ID:\s*)?([a-z0-9]+)\)?/i)
+          const hasPendingApproval = !!approvalMatch
           uiMsgs.push({
             id: row.name,
             type: 'agent',
@@ -402,23 +466,38 @@ async function loadMessages(instanceName, silent = false) {
             sender: 'agent',
             time: timeStr,
             isAI: true,
-            agentName,
+            agentName: displayAgentName,
             agentTool: toolLabel || null,
-            senderName: row.sender_name || agentName,
+            senderName: row.sender_name || displayAgentName,
             delivered: deliveryStatus,
+            msgType: isOperatorSender ? 'operator_to_customer' : 'agent_note',
+            approvalId: approvalMatch ? approvalMatch[1] : null,
+            approvalStatus: approvalMatch ? 'pending' : null,
+            approvalNote: '',
+            _expanded: hasPendingApproval,
           })
         }
       }
     }
 
-    // Update contact's lastMsg and name with the last user message
-    const lastUserMsg = [...(rows || [])].reverse().find(r => r.role === 'user')
-    if (lastUserMsg && contact) {
-      contact.lastMsg = (lastUserMsg.content || '').slice(0, 60)
-      // Update contact display name from sender_name if available
-      if (lastUserMsg.sender_name) {
-        contact.name = lastUserMsg.sender_name
-      }
+    // Update contact's lastMsg with last meaningful message (skip [System] noise)
+    const reversed = [...(rows || [])].reverse()
+    const lastMeaningful = reversed.find(r => {
+      const txt = (r.content || '').trim()
+      if (!txt) return false
+      if (txt.startsWith('[System]')) return false
+      if (txt.startsWith('[Approval')) return false
+      return true
+    })
+    if (lastMeaningful && contact) {
+      const preview = (lastMeaningful.content || '').slice(0, 60)
+      const prefix = lastMeaningful.role === 'user' ? '' : lastMeaningful.role === 'assistant' ? '🤖 ' : ''
+      contact.lastMsg = prefix + preview
+    }
+    // Update contact display name from sender_name if available
+    const lastUserMsg = reversed.find(r => r.role === 'user')
+    if (lastUserMsg?.sender_name && contact) {
+      contact.name = lastUserMsg.sender_name
     }
 
     const prevCount = messagesCache.value[instanceName]?.length || 0
@@ -436,7 +515,22 @@ async function loadMessages(instanceName, silent = false) {
 
 // ── Computed ──
 const selectedContact = computed(() => contacts.value.find(c => c.id === selectedContactId.value))
-const selectedMessages = computed(() => messagesCache.value[selectedContactId.value] || [])
+const allSelectedMessages = computed(() => messagesCache.value[selectedContactId.value] || [])
+const selectedMessages = computed(() => {
+  const msgs = allSelectedMessages.value
+  if (messageFilter.value === 'all') return msgs
+  if (messageFilter.value === 'customer') {
+    // Show customer inbound + agent-to-customer + operator-to-customer + date separators
+    const customerTypes = new Set(['customer_in', 'agent_to_customer', 'operator_to_customer'])
+    return msgs.filter(m => m.type === 'date' || customerTypes.has(m.msgType))
+  }
+  if (messageFilter.value === 'internal') {
+    // Show operator instructions + agent notes + date separators
+    const internalTypes = new Set(['operator_instruction', 'agent_note'])
+    return msgs.filter(m => m.type === 'date' || internalTypes.has(m.msgType))
+  }
+  return msgs
+})
 const badgeConfig = computed(() => statusConfig.default)
 const filteredContacts = computed(() => {
   const q = searchQuery.value.trim().toLowerCase()
@@ -447,6 +541,8 @@ const filteredContacts = computed(() => {
     c.instanceId.toLowerCase().includes(q)
   )
 })
+
+// ── Message type label helper (removed — layout makes types obvious) ──
 
 // ── Render helpers ──
 const renderText = (text) => {
@@ -468,17 +564,44 @@ const scrollToBottom = () => {
 const selectContact = async (id) => {
   selectedContactId.value = id
   showTyping.value = false
+  if (isMobile.value) mobileShowChat.value = true
   await loadMessages(id)
   scrollToBottom()
 }
 
-const openNewChat = () => {
+const mobileBack = () => {
+  mobileShowChat.value = false
+}
+
+const openNewChat = async () => {
   newChatPhone.value = ''
   newChatError.value = ''
+  newChatSelectedAgent.value = ''
   showNewChatModal.value = true
+  // Fetch agents with WhatsApp routing
+  try {
+    const res = await frappe('sena_agents_backend.sena_agents_backend.services.hook_evaluation_service.resolve_channel_routing_agents')
+    const waAgents = res?.whatsapp || res?.message?.whatsapp || {}
+    newChatAgents.value = Object.entries(waAgents).map(([name, info]) => ({
+      name,
+      default: info.default,
+      phones: info.phones || [],
+    }))
+    // Auto-select default agent if there is one
+    const defaultAgent = newChatAgents.value.find(a => a.default)
+    if (defaultAgent) newChatSelectedAgent.value = defaultAgent.name
+  } catch (e) {
+    console.error('Failed to load WhatsApp agents:', e)
+    newChatAgents.value = []
+  }
 }
 
 const startNewChat = async () => {
+  const agent = newChatSelectedAgent.value
+  if (!agent) {
+    newChatError.value = 'Please select an agent'
+    return
+  }
   const raw = newChatPhone.value.trim().replace(/[+\s\-()]/g, '')
   if (!raw || !/^\d{7,15}$/.test(raw)) {
     newChatError.value = 'Enter a valid phone number with country code (e.g. 919876543210)'
@@ -487,7 +610,7 @@ const startNewChat = async () => {
   newChatLoading.value = true
   newChatError.value = ''
   try {
-    const res = await frappe('sena_agents_backend.sena_agents_backend.api.whatsapp.find_or_create_chat', { phone: raw })
+    const res = await frappe('sena_whatsapp.api.whatsapp.find_or_create_chat', { phone: raw, agent_name: agent })
     const instanceId = res.instance_id
     showNewChatModal.value = false
 
@@ -527,6 +650,23 @@ const startNewChat = async () => {
   }
 }
 
+async function deleteChat(instanceId) {
+  if (!confirm('Delete this conversation? This cannot be undone.')) return
+  try {
+    await frappe('frappe.client.delete', { doctype: 'Runtime Instance', name: instanceId })
+    // Remove from local state
+    contacts.value = contacts.value.filter(c => c.id !== instanceId)
+    delete messagesCache.value[instanceId]
+    if (selectedContactId.value === instanceId) {
+      selectedContactId.value = contacts.value.length ? contacts.value[0].id : null
+      if (selectedContactId.value) loadMessages(selectedContactId.value)
+    }
+  } catch (e) {
+    console.error('[channels-ui] deleteChat failed:', e)
+    alert('Failed to delete: ' + e.message)
+  }
+}
+
 const sendMessage = async () => {
   if (!messageInput.value.trim() || !selectedContactId.value || sending.value) return
   const id = selectedContactId.value
@@ -547,11 +687,12 @@ const sendMessage = async () => {
     agentName: 'Operator',
     senderName: 'Operator',
     delivered: 'sent',
+    msgType: 'operator_to_customer',
   })
   scrollToBottom()
 
   try {
-    await frappe('sena_agents_backend.sena_agents_backend.api.whatsapp.send_direct_message', {
+    await frappe('sena_whatsapp.api.whatsapp.send_direct_message', {
       instance_id: id,
       message: text,
     })
@@ -568,6 +709,107 @@ const sendMessage = async () => {
     messageInput.value = text
   } finally {
     sending.value = false
+  }
+}
+
+const sendToAgent = async () => {
+  if (!messageInput.value.trim() || !selectedContactId.value || sending.value) return
+  const id = selectedContactId.value
+  const contact = selectedContact.value
+  const text = messageInput.value.trim()
+  messageInput.value = ''
+  sending.value = true
+
+  // Optimistically add to cache as operator instruction
+  if (!messagesCache.value[id]) messagesCache.value[id] = []
+  const optimisticId = `temp-agent-${Date.now()}`
+  messagesCache.value[id].push({
+    id: optimisticId,
+    type: 'text',
+    text,
+    sender: 'user',
+    time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
+    isAI: false,
+    senderName: 'Operator',
+    msgType: 'operator_instruction',
+  })
+  scrollToBottom()
+
+  try {
+    const targetAgent = contact?.agentName || agentName || 'Channels'
+    const instanceId = contact?.instanceId || id
+    await frappe('sena_agents_backend.sena_agents_backend.api.chat.send_message_stream', {
+      agent_name: targetAgent,
+      instance_id: instanceId,
+      message: text,
+    })
+    // Reload to get persisted state
+    await loadMessages(id, true)
+    scrollToBottom()
+  } catch (e) {
+    console.error('[channels-ui] sendToAgent failed:', e)
+    // Remove optimistic message on failure
+    const msgs = messagesCache.value[id]
+    const idx = msgs.findIndex(m => m.id === optimisticId)
+    if (idx !== -1) msgs.splice(idx, 1)
+    messageInput.value = text
+  } finally {
+    sending.value = false
+  }
+}
+
+// ── Inline approval actions ──
+async function handleApprove(msg) {
+  if (!msg.approvalId || msg.approvalStatus !== 'pending') return
+  msg.approvalStatus = 'approving'
+  const note = (msg.approvalNote || '').trim()
+  try {
+    const params = { request_name: msg.approvalId }
+    if (note) params.note = note
+    await frappeCall('sena_agents_backend.sena_agents_backend.api.approvals.approve', params)
+    msg.approvalStatus = 'approved'
+    // Reload messages after a short delay to get updated state
+    setTimeout(() => {
+      if (selectedContactId.value) loadMessages(selectedContactId.value, true)
+    }, 1500)
+  } catch (e) {
+    console.error('[channels-ui] approve failed:', e)
+    msg.approvalStatus = 'pending'
+  }
+}
+
+async function handleReject(msg) {
+  if (!msg.approvalId || msg.approvalStatus !== 'pending') return
+  msg.approvalStatus = 'rejecting'
+  const reason = (msg.approvalNote || '').trim()
+  try {
+    await frappeCall('sena_agents_backend.sena_agents_backend.api.approvals.reject', {
+      request_name: msg.approvalId,
+      reason,
+    })
+    msg.approvalStatus = 'rejected'
+    setTimeout(() => {
+      if (selectedContactId.value) loadMessages(selectedContactId.value, true)
+    }, 1500)
+  } catch (e) {
+    console.error('[channels-ui] reject failed:', e)
+    msg.approvalStatus = 'pending'
+  }
+}
+
+function openApprovalInPanel(approvalId) {
+  // Tell the parent Sena frontend to open the approvals sidebar and highlight this one
+  window.parent.postMessage({
+    type: 'sena:open-approval',
+    approvalId,
+  }, '*')
+}
+
+const handleSend = () => {
+  if (sendMode.value === 'agent') {
+    sendToAgent()
+  } else {
+    sendMessage()
   }
 }
 
@@ -593,7 +835,7 @@ const handleFileUpload = async (event) => {
 
     console.log('[channels-ui] Uploading file:', file.name, file.type, file.size, 'to', id)
 
-    const resp = await fetch('/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.send_direct_media', {
+    const resp = await fetch('/api/method/sena_whatsapp.api.whatsapp.send_direct_media', {
       method: 'POST',
       headers,
       credentials: 'include',
@@ -671,7 +913,7 @@ const sendVoiceNote = async (blob) => {
     const headers = { Accept: 'application/json' }
     if (_csrfToken) headers['X-Frappe-CSRF-Token'] = _csrfToken
 
-    const resp = await fetch('/api/method/sena_agents_backend.sena_agents_backend.api.whatsapp.send_direct_media', {
+    const resp = await fetch('/api/method/sena_whatsapp.api.whatsapp.send_direct_media', {
       method: 'POST',
       headers,
       credentials: 'include',
@@ -711,22 +953,40 @@ const formatRecordingTime = (seconds) => {
 let _pollInterval = null
 
 onMounted(async () => {
+  window.addEventListener('resize', onResize)
   await ensureAuth()
   await loadInstances()
   if (selectedContactId.value) {
     await loadMessages(selectedContactId.value)
     scrollToBottom()
   }
-  // Poll active conversation every 3 seconds for real-time updates
-  _pollInterval = setInterval(async () => {
-    if (selectedContactId.value) {
-      await loadMessages(selectedContactId.value, true) // silent = no spinner
-    }
-  }, 3000)
+  // Real-time updates: iframe mode uses postMessage from parent (which has Socket.IO).
+  // No polling — updates are event-driven only.
+  const isIframed = window.parent !== window
+  if (isIframed) {
+    window.addEventListener('message', _handleParentMessage)
+  }
 })
+
+async function _handleParentMessage(event) {
+  const msg = event.data
+  if (!msg || typeof msg !== 'object') return
+  // Parent sends: { type: 'wa_new_message', instance_id: '...' }
+  // or: { type: 'wa_instance_update' }
+  if (msg.type === 'wa_new_message') {
+    await loadInstances(true)
+    if (msg.instance_id && selectedContactId.value === msg.instance_id) {
+      await loadMessages(msg.instance_id, true)
+    }
+  } else if (msg.type === 'wa_instance_update') {
+    await loadInstances(true)
+  }
+}
 
 onUnmounted(() => {
   if (_pollInterval) clearInterval(_pollInterval)
+  window.removeEventListener('message', _handleParentMessage)
+  window.removeEventListener('resize', onResize)
 })
 
 watch(selectedContactId, async (id) => {
@@ -738,42 +998,54 @@ watch(selectedContactId, async (id) => {
 </script>
 
 <template>
-  <div class="app">
+  <div class="app" :class="{ 'app--mobile': isMobile }">
 
     <!-- ===== SIDEBAR ===== -->
-    <aside class="sidebar">
+    <aside class="sidebar" :class="{ 'sidebar--hidden': isMobile && mobileShowChat }">
       <!-- Header -->
       <div class="sidebar__header">
-        <div class="sidebar__brand">
-          <div class="sidebar__brand-icon">
-            <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421-12.421a9.965 9.965 0 00-5.384 1.562L3.6 3.6l-.563 3.067A9.965 9.965 0 002 12c0 5.523 4.477 10 10 10s10-4.477 10-10S17.523 2 12 2c-.018 0-.036.001-.054.001a9.99 9.99 0 00-.895-.04z"/></svg>
+        <div class="channel-selector">
+          <div
+            v-for="ch in channels"
+            :key="ch.id"
+            class="channel-selector__icon"
+            :class="{
+              'channel-selector__icon--active': activePlatforms.has(ch.id),
+              'channel-selector__icon--disabled': ch.id !== 'whatsapp'
+            }"
+            :style="[
+              activePlatforms.has(ch.id)
+                ? { background: ch.color, color: ch.textColor || '#fff', boxShadow: '0 0 0 1.5px #fff, 0 0 0 3px ' + ch.color }
+                : { background: '#CBD5E1', color: '#fff' }
+            ]"
+            :data-tooltip="ch.id !== 'whatsapp' ? ch.label + ' (coming soon)' : ch.label"
+            @click="ch.id === 'whatsapp' ? null : undefined"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path :d="ch.icon"/></svg>
           </div>
-          <span class="sidebar__brand-name">Channels</span>
-        </div>
-        <div class="sidebar__header-actions">
-          <button class="sidebar__icon-btn" @click="openNewChat" title="New chat">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          <!-- Select all toggle — hidden until more channels are active
+          <button
+            class="channel-selector__toggle"
+            :class="{ 'channel-selector__toggle--all': allSelected }"
+            :data-tooltip="allSelected ? 'Deselect all' : 'Select all'"
+            @click="toggleAllPlatforms"
+          >
+            <svg v-if="!allSelected" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>
+            <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 12h8"/></svg>
           </button>
+          -->
         </div>
       </div>
 
-      <!-- Platform tabs -->
-      <div class="sidebar__tabs">
-        <button
-          v-for="p in platforms"
-          :key="p.id"
-          :class="['sidebar__tab', { 'sidebar__tab--active': activePlatform === p.id }]"
-          @click="activePlatform = p.id"
-        >
-          <svg class="sidebar__tab-icon" width="13" height="13" viewBox="0 0 24 24" :fill="p.id === 'email' ? 'currentColor' : 'none'" :stroke="p.id === 'email' ? 'none' : 'currentColor'" stroke-width="1.5"><path :d="p.icon"/></svg>
-          {{ p.label }}
-        </button>
-      </div>
-
-      <!-- Search -->
+      <!-- Search + New chat -->
       <div class="sidebar__search">
-        <svg class="sidebar__search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-        <input v-model="searchQuery" type="text" class="sidebar__search-input" placeholder="Search or start new chat" />
+        <div class="sidebar__search-field">
+          <svg class="sidebar__search-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          <input v-model="searchQuery" type="text" class="sidebar__search-input" placeholder="Search or start new chat" />
+        </div>
+        <button class="sidebar__icon-btn sidebar__search-action" @click="openNewChat" title="New chat">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
       </div>
 
       <!-- Contact list -->
@@ -830,17 +1102,29 @@ watch(selectedContactId, async (id) => {
               <span class="contact__status" :style="{ color: statusConfig.default.color, background: statusConfig.default.bg }">{{ contact.status }}</span>
             </div>
           </div>
+          <button
+            class="contact__delete"
+            title="Delete conversation"
+            @click.stop="deleteChat(contact.id)"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6"/><path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+          </button>
         </div>
       </div>
     </aside>
 
     <!-- ===== CHAT ===== -->
-    <main class="chat" v-if="selectedContact">
+    <main class="chat" :class="{ 'chat--visible': !isMobile || mobileShowChat }" v-if="selectedContact || (isMobile && mobileShowChat)">
 
       <!-- Chat header -->
       <div class="chat__header">
         <div class="chat__header-left">
-          <div class="chat__avatar" :style="{ background: selectedContact.color }">
+          <button v-if="isMobile" class="chat__back-btn" @click="mobileBack">
+            <svg width="20" height="20" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+            </svg>
+          </button>
+          <div class="chat__avatar" :style="{ background: selectedContact?.color }">
             {{ selectedContact.name[0] }}
             <div v-if="selectedContact.online" class="chat__avatar-online"></div>
           </div>
@@ -855,16 +1139,22 @@ watch(selectedContactId, async (id) => {
           </div>
         </div>
         <div class="chat__header-actions">
-          <button class="chat__header-btn">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07A19.5 19.5 0 013.07 8.81 19.79 19.79 0 01.13 2.18 2 2 0 012.11 0h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L6.09 7.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z"/></svg>
-          </button>
+          <span class="chat__status-dot" :class="{ 'chat__status-dot--active': selectedContact.status === 'Active' }"></span>
           <button class="chat__header-btn">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
           </button>
-          <span class="chat__pipeline-badge" :style="{ color: statusConfig.default.color, background: statusConfig.default.bg }">
-            {{ selectedContact.status }}
-          </span>
         </div>
+      </div>
+
+      <!-- Message filter bar -->
+      <div class="chat__filter-bar">
+        <button
+          v-for="f in [{ id: 'all', label: 'All' }, { id: 'customer', label: 'Customer' }, { id: 'internal', label: 'Internal' }]"
+          :key="f.id"
+          class="filter-pill"
+          :class="{ 'filter-pill--active': messageFilter === f.id }"
+          @click="messageFilter = f.id; if (f.id === 'customer') sendMode = 'customer'; else if (f.id === 'internal') sendMode = 'agent'"
+        >{{ f.label }}</button>
       </div>
 
       <!-- Messages -->
@@ -890,42 +1180,73 @@ watch(selectedContactId, async (id) => {
             <span>{{ msg.label }}</span>
           </div>
 
-          <!-- User text bubble (received — left side) -->
-          <div v-else-if="msg.type === 'text' && msg.sender === 'user'" class="msg msg--in">
-            <div class="bubble bubble--in">
-              <div v-if="msg.senderName" class="bubble__sender-header">
-                <span class="bubble__sender-name">{{ msg.senderName }}</span>
-              </div>
-              <div class="bubble__text" v-html="renderText(msg.text)"></div>
-              <div class="bubble__meta">
-                <span class="bubble__time">{{ msg.time }}</span>
+          <!-- Customer message (left) -->
+          <div v-else-if="msg.type === 'text' && msg.sender === 'user' && msg.msgType !== 'operator_instruction'" class="msg msg--in">
+            <div class="msg__wrapper">
+              <span v-if="msg.senderName" class="bubble__sender-label">{{ msg.senderName }}</span>
+              <div class="bubble bubble--customer">
+                <div class="bubble__text" v-html="renderText(msg.text)"></div>
+                <div class="bubble__meta">
+                  <span class="bubble__time">{{ msg.time }}</span>
+                </div>
               </div>
             </div>
           </div>
 
-          <!-- Agent AI bubble (sent — right side) -->
-          <div v-else-if="msg.type === 'agent'" class="msg msg--out">
-            <div class="bubble bubble--out">
-              <div class="bubble__agent-header">
-                <span class="bubble__agent-dot"></span>
-                <span class="bubble__agent-name">{{ msg.agentName }}</span>
-                <template v-if="msg.agentTool">
-                  <span class="bubble__agent-sep">·</span>
-                  <span class="bubble__agent-tool">{{ msg.agentTool }}</span>
-                </template>
+          <!-- Internal message (dashed) — operator instructions right, agent notes left -->
+          <div v-else-if="(msg.type === 'text' && msg.msgType === 'operator_instruction') || (msg.type === 'agent' && msg.msgType === 'agent_note')" class="msg" :class="msg.msgType === 'operator_instruction' ? 'msg--out' : 'msg--in'">
+            <div class="internal-msg">
+              <div class="internal-msg__text" v-html="renderText(msg.text)"></div>
+              <div class="internal-msg__meta">
+                <span class="internal-msg__who">{{ msg.msgType === 'operator_instruction' ? 'you' : msg.agentName || 'agent' }}</span>
+                <span class="internal-msg__time">{{ msg.time }}</span>
               </div>
-              <div class="bubble__text" v-html="renderText(msg.text)"></div>
-              <div class="bubble__meta">
-                <span class="bubble__time">{{ msg.time }}</span>
-                <span class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.delivered === 'read', 'bubble__ticks--delivered': msg.delivered === 'delivered' }">
-                  <svg v-if="msg.delivered === 'sent'" width="14" height="10" viewBox="0 0 14 10" fill="none">
-                    <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                  </svg>
-                  <svg v-else width="14" height="10" viewBox="0 0 14 10" fill="none">
-                    <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                  </svg>
-                </span>
+              <!-- Approval actions if present -->
+              <div v-if="msg.approvalId && msg.approvalStatus === 'pending'" class="internal-msg__approval">
+                <input v-model="msg.approvalNote" class="approval-note-input" type="text" placeholder="Note (optional)..." @click.stop @keydown.enter.stop="handleApprove(msg)" />
+                <div class="internal-msg__approval-btns">
+                  <button class="approval-btn approval-btn--approve" @click.stop="handleApprove(msg)">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                    Approve
+                  </button>
+                  <button class="approval-btn approval-btn--reject" @click.stop="handleReject(msg)">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    Reject
+                  </button>
+                </div>
+                <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View in approvals →</button>
+              </div>
+              <div v-else-if="msg.approvalId && msg.approvalStatus === 'approved'" class="internal-msg__approval-resolved">
+                <span class="internal-msg__approval-status internal-msg__approval-status--approved">Approved</span>
+                <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View →</button>
+              </div>
+              <div v-else-if="msg.approvalId && msg.approvalStatus === 'rejected'" class="internal-msg__approval-resolved">
+                <span class="internal-msg__approval-status internal-msg__approval-status--rejected">Rejected</span>
+                <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View →</button>
+              </div>
+              <div v-else-if="msg.approvalId && (msg.approvalStatus === 'approving' || msg.approvalStatus === 'rejecting')" class="internal-msg__approval-status">{{ msg.approvalStatus }}...</div>
+            </div>
+          </div>
+
+          <!-- Agent → Customer bubble (sent — right side) -->
+          <div v-else-if="msg.type === 'agent' && (msg.msgType === 'agent_to_customer' || msg.msgType === 'operator_to_customer')" class="msg msg--out">
+            <div class="msg__wrapper">
+              <span class="msg__sender-label msg__sender-label--agent">{{ msg.msgType === 'operator_to_customer' ? 'You' : msg.agentName }}</span>
+              <div class="bubble bubble--agent-to-customer">
+                <div class="bubble__text" v-html="renderText(msg.text)"></div>
+                <div class="bubble__meta">
+                  <span class="bubble__time">{{ msg.time }}</span>
+                  <svg class="bubble__wa-icon" width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+                  <span class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.delivered === 'read', 'bubble__ticks--delivered': msg.delivered === 'delivered' }">
+                    <svg v-if="msg.delivered === 'sent'" width="14" height="10" viewBox="0 0 14 10" fill="none">
+                      <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <svg v-else width="14" height="10" viewBox="0 0 14 10" fill="none">
+                      <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      <path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </span>
+                </div>
               </div>
             </div>
           </div>
@@ -1026,26 +1347,38 @@ watch(selectedContactId, async (id) => {
       </div>
 
       <!-- Normal input bar -->
-      <div v-else class="chat__input-bar">
-        <button class="input-btn" @click="triggerFileUpload" :disabled="sending">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+      <div v-else class="chat__input-bar" :class="sendMode === 'agent' ? 'chat__input-bar--agent' : ''">
+        <!-- Send mode toggle pill -->
+        <button
+          class="mode-pill"
+          :class="sendMode === 'agent' ? 'mode-pill--agent' : 'mode-pill--customer'"
+          :title="sendMode === 'customer' ? 'Sending to customer — click to switch to agent' : 'Sending to agent — click to switch to customer'"
+          @click="sendMode = sendMode === 'customer' ? 'agent' : 'customer'"
+        >
+          <!-- WhatsApp icon when customer mode -->
+          <svg v-if="sendMode === 'customer'" width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+          <!-- Robot icon when agent mode -->
+          <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M12 11V5"/><circle cx="12" cy="4" r="2"/></svg>
+        </button>
+        <button v-if="sendMode === 'customer'" class="input-btn" @click="triggerFileUpload" :disabled="sending">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
         </button>
         <div class="input-wrap">
           <input
             v-model="messageInput"
             type="text"
             class="input-field"
-            :placeholder="sending ? 'Sending...' : 'Type a message'"
+            :placeholder="sending ? 'Sending...' : (sendMode === 'agent' ? 'Instruct agent...' : 'Message customer...')"
             :disabled="sending"
-            @keyup.enter="sendMessage"
+            @keyup.enter="handleSend"
           />
         </div>
-        <!-- Show send button when there's text, mic button when empty -->
-        <button v-if="messageInput.trim()" class="input-btn input-btn--send" @click="sendMessage" :disabled="sending">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        <!-- Show send button when there's text, mic button when empty (customer mode only) -->
+        <button v-if="messageInput.trim()" class="input-btn input-btn--send" @click="handleSend" :disabled="sending">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         </button>
-        <button v-else class="input-btn input-btn--mic" @click="startRecording" :disabled="sending">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+        <button v-else-if="sendMode === 'customer'" class="input-btn input-btn--mic" @click="startRecording" :disabled="sending">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
         </button>
       </div>
 
@@ -1059,6 +1392,15 @@ watch(selectedContactId, async (id) => {
           <button class="modal__close" @click="showNewChatModal = false">&times;</button>
         </div>
         <div class="modal__body">
+          <div style="margin-bottom:12px">
+            <label style="display:block;margin-bottom:4px;font-size:13px;color:#64748b">Agent</label>
+            <select v-model="newChatSelectedAgent" style="width:100%;padding:8px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px;background:#fff" :disabled="newChatLoading">
+              <option value="" disabled>Select an agent…</option>
+              <option v-for="a in newChatAgents" :key="a.name" :value="a.name">
+                {{ a.name }}{{ a.default ? ' (default)' : '' }}
+              </option>
+            </select>
+          </div>
           <label class="modal__label">Phone number (with country code)</label>
           <input
             v-model="newChatPhone"
@@ -1175,33 +1517,125 @@ watch(selectedContactId, async (id) => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
+  padding: 10px 12px;
   background: #F8F7F4;
   border-bottom: 1px solid rgba(0,0,0,0.06);
+  overflow: visible;
+  position: relative;
+  z-index: 2;
 }
 
-.sidebar__brand {
+.channel-selector {
   display: flex;
   align-items: center;
-  gap: 8px;
+  column-gap: 6px;
+  row-gap: 8px;
+  flex-wrap: wrap;
+  flex: 1;
+  min-width: 0;
+  overflow: visible;
 }
 
-.sidebar__brand-icon {
-  width: 26px;
-  height: 26px;
-  border-radius: 50%;
-  background: #3B82F6;
+.channel-selector__icon {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  opacity: 0.45;
 }
 
-.sidebar__brand-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: #1E293B;
-  letter-spacing: -0.01em;
+.channel-selector__icon::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: -24px;
+  left: 50%;
+  transform: translateX(-50%) scale(0.8);
+  background: #1E293B;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: all 0.15s ease;
+  z-index: 10;
+}
+
+.channel-selector__icon:hover::after {
+  opacity: 1;
+  transform: translateX(-50%) scale(1);
+}
+
+.channel-selector__icon--active {
+  opacity: 1;
+}
+
+.channel-selector__icon--disabled {
+  cursor: not-allowed;
+}
+
+.channel-selector__icon:hover:not(.channel-selector__icon--active):not(.channel-selector__icon--disabled) {
+  opacity: 0.85;
+  filter: saturate(1.5);
+}
+
+.channel-selector__toggle {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1.5px dashed #CBD5E1;
+  background: transparent;
+  color: #94A3B8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s;
+  position: relative;
+}
+
+.channel-selector__toggle:hover {
+  border-color: #64748B;
+  color: #475569;
+  background: rgba(0,0,0,0.03);
+}
+
+.channel-selector__toggle--all {
+  border-style: solid;
+  border-color: #94A3B8;
+}
+
+.channel-selector__toggle::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: -24px;
+  left: 50%;
+  transform: translateX(-50%) scale(0.8);
+  background: #1E293B;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 2px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: all 0.15s ease;
+  z-index: 10;
+}
+
+.channel-selector__toggle:hover::after {
+  opacity: 1;
+  transform: translateX(-50%) scale(1);
 }
 
 .sidebar__header-actions {
@@ -1270,11 +1704,25 @@ watch(selectedContactId, async (id) => {
   padding: 6px 10px;
   background: #FAF9F5;
   position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sidebar__search-field {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+
+.sidebar__search-action {
+  flex-shrink: 0;
 }
 
 .sidebar__search-icon {
   position: absolute;
-  left: 22px;
+  left: 10px;
   top: 50%;
   transform: translateY(-50%);
   color: #94A3B8;
@@ -1325,8 +1773,35 @@ watch(selectedContactId, async (id) => {
   background: rgba(0,0,0,0.02);
 }
 
+.contact:hover .contact__delete {
+  opacity: 1;
+}
+
 .contact--active {
   background: rgba(59,130,246,0.06);
+}
+
+.contact__delete {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: rgba(239, 68, 68, 0.08);
+  color: #EF4444;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+
+.contact__delete:hover {
+  background: rgba(239, 68, 68, 0.15);
 }
 
 .contact__avatar {
@@ -1555,13 +2030,17 @@ watch(selectedContactId, async (id) => {
   color: #64748B;
 }
 
-.chat__pipeline-badge {
-  font-size: 8.5px;
-  font-weight: 600;
-  padding: 2px 7px;
-  border-radius: 4px;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
+/* Status dot in header */
+.chat__status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #CBD5E1;
+  flex-shrink: 0;
+}
+
+.chat__status-dot--active {
+  background: #10B981;
 }
 
 /* ===== MESSAGES ===== */
@@ -1609,20 +2088,90 @@ watch(selectedContactId, async (id) => {
   padding: 6px 10px 4px;
   border-radius: 8px;
   position: relative;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.07);
   word-break: break-word;
 }
 
+/* Customer inbound (left) */
+.bubble--customer {
+  background: #FAFAF8;
+  border: 1px solid rgba(30, 41, 59, 0.12);
+  border-radius: 2px 12px 12px 12px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+/* Agent → Customer (right) */
+.bubble--agent-to-customer {
+  background: linear-gradient(135deg, rgba(37, 211, 102, 0.06) 0%, rgba(59, 130, 246, 0.06) 100%);
+  border: 1px solid rgba(37, 211, 102, 0.15);
+  border-radius: 12px 2px 12px 12px;
+}
+
+/* Agent note — internal (right) */
+.bubble--agent-note {
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-left: 3px solid rgba(59, 130, 246, 0.4);
+  border-radius: 0 8px 8px 0;
+}
+
+.bubble--agent-note .bubble__text {
+  font-size: 12px;
+}
+
+/* Operator instruction (right) */
+.bubble--operator-instruction {
+  background: transparent;
+  border: 1px dashed rgba(0, 0, 0, 0.12);
+  border-radius: 8px;
+}
+
+.bubble--operator-instruction .bubble__text {
+  font-style: italic;
+  color: #64748B;
+}
+
+/* Sender label above customer bubble */
+.bubble__sender-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: #94A3B8;
+  margin-bottom: 2px;
+  padding-left: 2px;
+}
+
+/* Sender label above agent/operator bubble (right-aligned) */
+.msg__sender-label {
+  font-size: 11px;
+  font-weight: 500;
+  color: #94A3B8;
+  margin-bottom: 2px;
+  padding-right: 2px;
+}
+
+.msg__sender-label--agent {
+  text-align: right;
+}
+
+/* Operator "you" label inside instruction */
+.bubble__operator-label {
+  font-size: 10px;
+  font-weight: 500;
+  color: #94A3B8;
+  margin-bottom: 2px;
+}
+
+/* Legacy compat */
 .bubble--out {
-  background: #EEF2FF;
-  border: 1px solid rgba(59,130,246,0.12);
-  border-radius: 8px 0 8px 8px;
+  background: linear-gradient(135deg, rgba(37, 211, 102, 0.06) 0%, rgba(59, 130, 246, 0.06) 100%);
+  border: 1px solid rgba(37, 211, 102, 0.15);
+  border-radius: 12px 2px 12px 12px;
 }
 
 .bubble--in {
-  background: #FFFFFF;
-  border: 1px solid rgba(0,0,0,0.06);
-  border-radius: 0 8px 8px 8px;
+  background: #FAFAF8;
+  border: 1px solid rgba(30, 41, 59, 0.12);
+  border-radius: 2px 12px 12px 12px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 
 .bubble--media {
@@ -1657,51 +2206,44 @@ watch(selectedContactId, async (id) => {
 .bubble__agent-header {
   display: flex;
   align-items: center;
-  gap: 5px;
-  margin-bottom: 5px;
-  padding-bottom: 5px;
-  border-bottom: 1px solid rgba(0,0,0,0.06);
+  gap: 4px;
+  margin-bottom: 4px;
 }
 
 .bubble__agent-dot {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: #3B82F6;
+  background: #25D366;
   flex-shrink: 0;
 }
 
+.bubble__agent-dot--blue {
+  background: #3B82F6;
+}
+
 .bubble__agent-name {
-  font-size: 10.5px;
-  font-weight: 600;
-  color: #3B82F6;
+  font-size: 10px;
+  font-weight: 500;
+  color: #94A3B8;
 }
 
 .bubble__agent-sep {
   color: #CBD5E1;
-  font-size: 10.5px;
+  font-size: 10px;
 }
 
 .bubble__agent-tool {
-  font-size: 10px;
+  font-size: 9px;
   color: #94A3B8;
   font-family: 'SF Mono', 'Fira Code', monospace;
 }
 
-/* Sender header inside user bubble */
-.bubble__sender-header {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  margin-bottom: 5px;
-  padding-bottom: 5px;
-  border-bottom: 1px solid rgba(0,0,0,0.06);
-}
-
-.bubble__sender-name {
-  font-size: 10.5px;
-  font-weight: 600;
-  color: #6366F1;
+/* WhatsApp send indicator icon */
+.bubble__wa-icon {
+  color: #94A3B8;
+  opacity: 0.6;
+  flex-shrink: 0;
 }
 
 /* Bubble text */
@@ -1898,20 +2440,84 @@ watch(selectedContactId, async (id) => {
   color: #64748B;
 }
 
-/* ===== INPUT BAR — matches Sena ChatInput ===== */
+/* ===== INPUT BAR — Sena ChatInput elevated ===== */
 .chat__input-bar {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 10px 16px 12px;
-  background: #F5F4EF;
+  gap: 4px;
+  margin: 8px 12px 12px;
+  border: 1.5px solid rgba(30, 41, 59, 0.25);
+  background: linear-gradient(135deg, #FFFEFB 0%, #FBF9F5 100%);
+  box-shadow:
+    0 4px 12px -2px rgba(0, 0, 0, 0.08),
+    0 2px 6px -1px rgba(0, 0, 0, 0.06),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.9);
+  border-radius: 14px;
+  padding: 6px 8px;
   flex-shrink: 0;
   z-index: 1;
+  transition: all 0.15s ease;
+}
+
+.chat__input-bar:focus-within {
+  border-color: rgba(30, 41, 59, 0.4);
+  box-shadow:
+    0 4px 12px -2px rgba(0, 0, 0, 0.1),
+    0 2px 6px -1px rgba(0, 0, 0, 0.08),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.9),
+    0 0 0 3px rgba(30, 41, 59, 0.06);
+  transform: translateY(-0.5px);
+}
+
+.chat__input-bar--agent {
+  border-color: rgba(139, 92, 246, 0.3);
+  background: linear-gradient(135deg, #FEFBFF 0%, #F9F5FB 100%);
+}
+
+.chat__input-bar--agent:focus-within {
+  border-color: rgba(139, 92, 246, 0.5);
+  box-shadow:
+    0 4px 12px -2px rgba(0, 0, 0, 0.1),
+    0 2px 6px -1px rgba(0, 0, 0, 0.08),
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.9),
+    0 0 0 3px rgba(139, 92, 246, 0.06);
+}
+
+/* Mode toggle pill */
+.mode-pill {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+
+.mode-pill--customer {
+  background: rgba(37, 211, 102, 0.1);
+  color: #25D366;
+}
+
+.mode-pill--customer:hover {
+  background: rgba(37, 211, 102, 0.18);
+}
+
+.mode-pill--agent {
+  background: rgba(139, 92, 246, 0.1);
+  color: #8B5CF6;
+}
+
+.mode-pill--agent:hover {
+  background: rgba(139, 92, 246, 0.18);
 }
 
 .input-btn {
-  width: 34px;
-  height: 34px;
+  width: 30px;
+  height: 30px;
   border: none;
   background: transparent;
   border-radius: 8px;
@@ -1936,35 +2542,29 @@ watch(selectedContactId, async (id) => {
 
 .input-field {
   width: 100%;
-  padding: 10px 14px;
-  background: linear-gradient(135deg, #FFFEFB 0%, #FBF9F5 100%);
-  border: 1.5px solid rgba(30,41,59,0.18);
-  border-radius: 1rem;
-  font-size: 13.5px;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  font-size: 13px;
   color: #1E293B;
   outline: none;
   font-family: inherit;
-  box-shadow: 0 2px 8px -2px rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.9);
-  transition: border-color 0.2s, box-shadow 0.2s;
 }
 
 .input-field::placeholder {
   color: #94A3B8;
 }
 
-.input-field:focus {
-  border-color: rgba(30,41,59,0.35);
-  box-shadow: 0 4px 12px -2px rgba(0,0,0,0.1), inset 0 1px 0 rgba(255,255,255,1), 0 0 0 3px rgba(30,41,59,0.06);
-}
-
 .input-btn--send {
-  background: #3B82F6;
+  background: #1E293B;
   color: white;
   border-radius: 50%;
+  width: 28px;
+  height: 28px;
 }
 
 .input-btn--send:hover {
-  background: #2563EB;
+  background: #334155;
   color: white;
 }
 
@@ -1995,8 +2595,8 @@ watch(selectedContactId, async (id) => {
 
 /* Recording state */
 .chat__input-bar--recording {
-  background: #FEF2F2;
-  border-top-color: #FECACA;
+  background: linear-gradient(135deg, #FEF2F2 0%, #FFF5F5 100%);
+  border-color: rgba(239, 68, 68, 0.25);
 }
 
 .recording-indicator {
@@ -2139,5 +2739,473 @@ watch(selectedContactId, async (id) => {
 .modal__btn--start:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+/* ===== MOBILE RESPONSIVENESS ===== */
+
+.chat__back-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  border-radius: 6px;
+  color: #64748B;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+
+.chat__back-btn:hover {
+  background: rgba(0,0,0,0.04);
+}
+
+/* On mobile the chat panel is hidden by default, visible when a contact is tapped */
+.chat--visible {
+  /* only used for mobile logic via JS class binding */
+}
+
+/* ===== MESSAGE FILTER BAR ===== */
+.chat__filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  background: #F8F7F4;
+  border-bottom: 1px solid rgba(0,0,0,0.06);
+  flex-shrink: 0;
+  z-index: 1;
+}
+
+.filter-pill {
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 500;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: #94A3B8;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.filter-pill:hover {
+  background: rgba(30, 41, 59, 0.04);
+  color: #64748B;
+}
+
+.filter-pill--active {
+  background: rgba(30, 41, 59, 0.06);
+  color: #334155;
+  border-color: rgba(30, 41, 59, 0.1);
+}
+
+/* ===== MESSAGE WRAPPER ===== */
+.msg__wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 65%;
+}
+
+.msg--in .msg__wrapper {
+  align-items: flex-start;
+}
+
+.msg--out .msg__wrapper {
+  align-items: flex-end;
+}
+
+.msg--in .msg__wrapper .bubble,
+.msg--out .msg__wrapper .bubble {
+  max-width: 100%;
+}
+
+/* ===== INLINE APPROVAL ===== */
+.approval-note-input {
+  width: 100%;
+  padding: 4px 8px;
+  border: 1px solid rgba(139, 92, 246, 0.2);
+  border-radius: 6px;
+  font-size: 10px;
+  font-family: inherit;
+  color: #334155;
+  background: rgba(255, 255, 255, 0.6);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.approval-note-input::placeholder {
+  color: #94a3b8;
+}
+
+.approval-note-input:focus {
+  border-color: rgba(139, 92, 246, 0.5);
+  background: #fff;
+}
+
+.bubble__approval {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(139, 92, 246, 0.15);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.bubble__approval--resolving {
+  opacity: 0.7;
+}
+
+.bubble__approval-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.approval-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: inherit;
+}
+
+.approval-btn--approve {
+  background: rgba(34, 197, 94, 0.08);
+  border-color: rgba(34, 197, 94, 0.3);
+  color: #16a34a;
+}
+
+.approval-btn--approve:hover {
+  background: rgba(34, 197, 94, 0.15);
+  border-color: rgba(34, 197, 94, 0.5);
+}
+
+.approval-btn--reject {
+  background: rgba(239, 68, 68, 0.06);
+  border-color: rgba(239, 68, 68, 0.2);
+  color: #dc2626;
+}
+
+.approval-btn--reject:hover {
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.approval-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: none;
+  border: none;
+  font-size: 10px;
+  color: #8b5cf6;
+  cursor: pointer;
+  padding: 0;
+  font-family: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  opacity: 0.7;
+  transition: opacity 0.15s;
+}
+
+.approval-link:hover {
+  opacity: 1;
+}
+
+.approval-status {
+  font-size: 11px;
+  font-weight: 600;
+  color: #94a3b8;
+}
+
+.approval-status--approved {
+  color: #16a34a;
+}
+
+.approval-status--rejected {
+  color: #dc2626;
+}
+
+
+/* ===== AGENT NOTES (collapsed) ===== */
+.msg--note {
+  display: flex;
+  justify-content: center;
+  padding: 2px 40px;
+}
+
+.agent-note {
+  max-width: 80%;
+  cursor: pointer;
+  user-select: none;
+}
+
+.agent-note__indicator {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.03);
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  transition: background 0.15s ease;
+}
+
+.agent-note__indicator:hover {
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.agent-note__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #3B82F6;
+  flex-shrink: 0;
+}
+
+.agent-note__label {
+  font-size: 11px;
+  color: #64748B;
+  font-weight: 500;
+}
+
+.agent-note__time {
+  font-size: 10px;
+  color: #94A3B8;
+}
+
+.agent-note__chevron {
+  color: #94A3B8;
+  transition: transform 0.15s ease;
+  flex-shrink: 0;
+}
+
+.agent-note__chevron--open {
+  transform: rotate(180deg);
+}
+
+.agent-note__content {
+  margin-top: 6px;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.02);
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  border-radius: 8px;
+  font-size: 12px;
+  color: #64748B;
+  line-height: 1.5;
+}
+
+.agent-note__icon {
+  color: #94A3B8;
+  flex-shrink: 0;
+}
+
+.agent-note__text {
+  word-break: break-word;
+}
+
+/* Approval action card */
+.msg--approval-card {
+  display: flex;
+  justify-content: center;
+  padding: 4px 24px;
+}
+
+.approval-card {
+  max-width: 88%;
+  width: 100%;
+  background: rgba(245, 158, 11, 0.04);
+  border: 1px solid rgba(245, 158, 11, 0.2);
+  border-radius: 10px;
+  padding: 10px 14px;
+  transition: all 0.15s ease;
+}
+
+.approval-card--resolved {
+  background: rgba(0, 0, 0, 0.02);
+  border-color: rgba(0, 0, 0, 0.06);
+}
+
+.approval-card__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+  color: #D97706;
+}
+
+.approval-card--resolved .approval-card__header {
+  color: #94A3B8;
+}
+
+.approval-card__title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #D97706;
+}
+
+.approval-card__title--approved {
+  color: #10B981;
+}
+
+.approval-card__title--rejected {
+  color: #EF4444;
+}
+
+.approval-card__time {
+  font-size: 10px;
+  color: #94A3B8;
+  margin-left: auto;
+}
+
+.approval-card__body {
+  font-size: 12px;
+  color: #64748B;
+  line-height: 1.5;
+  margin-bottom: 8px;
+  word-break: break-word;
+}
+
+.approval-card__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Internal messages (dashed) — agent notes + operator instructions */
+.internal-msg {
+  max-width: 75%;
+  border: 1px dashed rgba(0, 0, 0, 0.15);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: transparent;
+}
+
+.internal-msg__text {
+  font-size: 12px;
+  color: #64748B;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.internal-msg__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.internal-msg__who {
+  font-size: 10px;
+  font-weight: 600;
+  color: #94A3B8;
+  text-transform: lowercase;
+}
+
+.internal-msg__time {
+  font-size: 10px;
+  color: #94A3B8;
+}
+
+.internal-msg__approval {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.internal-msg__approval-btns {
+  display: flex;
+  gap: 6px;
+}
+
+.internal-msg__approval-status {
+  margin-top: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #94A3B8;
+}
+
+.internal-msg__approval-status--approved {
+  color: #10B981;
+}
+
+.internal-msg__approval-status--rejected {
+  color: #EF4444;
+}
+
+.internal-msg__approval-resolved {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+@media (max-width: 768px) {
+  .app {
+    flex-direction: column;
+    position: relative;
+  }
+
+  .sidebar {
+    width: 100%;
+    height: 100vh;
+    flex-shrink: 0;
+    border-right: none;
+  }
+
+  .sidebar--hidden {
+    display: none;
+  }
+
+  .chat {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    height: 100vh;
+    z-index: 10;
+    display: none;
+  }
+
+  .chat--visible {
+    display: flex;
+  }
+
+  .chat__messages {
+    padding: 12px 4%;
+  }
+
+  .bubble {
+    max-width: 80%;
+  }
+
+  .chat__input-bar {
+    margin: 6px 8px 8px;
+    padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .chat__header {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+
+  .sidebar__header {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
 }
 </style>
