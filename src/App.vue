@@ -553,7 +553,7 @@ async function loadMessages(instanceName, silent = false) {
     })
     if (lastMeaningful && contact) {
       const preview = (lastMeaningful.content || '').slice(0, 60)
-      const prefix = lastMeaningful.role === 'user' ? '' : lastMeaningful.role === 'assistant' ? '🤖 ' : ''
+      const prefix = ''
       contact.lastMsg = prefix + preview
     }
     // Update contact display name from sender_name if available
@@ -1168,7 +1168,10 @@ watch(selectedContactId, async (id) => {
               <span class="contact__preview" style="font-size: 10px; color: #94A3B8;">{{ contact.phone }}</span>
             </div>
             <div class="contact__row3">
-              <span class="contact__company">{{ contact.company }}</span>
+              <span class="contact__agent-tag">
+                <svg class="contact__agent-icon" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a4 4 0 0 1 4 4v2a4 4 0 0 1-8 0V6a4 4 0 0 1 4-4z"/><path d="M16 14H8a5 5 0 0 0-5 5v1h18v-1a5 5 0 0 0-5-5z"/></svg>
+                {{ contact.company }}
+              </span>
               <span class="contact__status" :style="{ color: statusConfig.default.color, background: statusConfig.default.bg }">{{ contact.status }}</span>
             </div>
           </div>
@@ -1981,13 +1984,26 @@ watch(selectedContactId, async (id) => {
   flex-shrink: 0;
 }
 
-.contact__company {
-  font-size: 10px;
-  color: #94A3B8;
+.contact__agent-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 9.5px;
+  font-weight: 500;
+  color: #6366F1;
+  background: rgba(99, 102, 241, 0.08);
+  border: 1px solid rgba(99, 102, 241, 0.15);
+  padding: 1px 6px 1px 4px;
+  border-radius: 10px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  flex: 1;
+  max-width: 50%;
+}
+
+.contact__agent-icon {
+  flex-shrink: 0;
+  opacity: 0.7;
 }
 
 .contact__status {
