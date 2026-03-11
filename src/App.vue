@@ -229,7 +229,7 @@ async function loadInstances(silent = false) {
           const cur = await frappe('frappe.client.get_value', {
             doctype: 'Runtime Agent', filters: { agent_name: agentName }, fieldname: 'ui',
           })
-          uiName = cur?.message?.ui
+          uiName = cur?.ui
         }
         if (uiName) {
           const agents = await frappe('frappe.client.get_list', {
