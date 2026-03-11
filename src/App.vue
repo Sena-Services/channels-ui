@@ -223,13 +223,25 @@ async function loadInstances(silent = false) {
     // Find all agents sharing this UI, then show all their WhatsApp instances
     if (!_uiAgents) {
       try {
-        const agents = await frappe('frappe.client.get_list', {
-          doctype: 'Runtime Agent',
-          filters: [['ui_iframe_url', 'like', '%whatsapp-channels%'], ['enabled', '=', 1]],
-          fields: ['agent_name'],
-          limit_page_length: 100,
-        })
-        _uiAgents = (agents || []).map(a => a.agent_name)
+        // First get the current agent's UI name, then find all agents sharing it
+        let uiName = null
+        if (agentName) {
+          const cur = await frappe('frappe.client.get_value', {
+            doctype: 'Runtime Agent', filters: { agent_name: agentName }, fieldname: 'ui',
+          })
+          uiName = cur?.message?.ui
+        }
+        if (uiName) {
+          const agents = await frappe('frappe.client.get_list', {
+            doctype: 'Runtime Agent',
+            filters: [['ui', '=', uiName], ['enabled', '=', 1]],
+            fields: ['agent_name'],
+            limit_page_length: 100,
+          })
+          _uiAgents = (agents || []).map(a => a.agent_name)
+        } else {
+          _uiAgents = agentName ? [agentName] : []
+        }
       } catch (e) {
         _uiAgents = agentName ? [agentName] : []
       }
