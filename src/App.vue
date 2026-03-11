@@ -342,6 +342,33 @@ async function loadMessages(instanceName, silent = false) {
     }))
     const displayAgentName = contact?.agentName || 'Agent'
 
+    // Build map of tool_call_id → approval info from tool-result messages
+    const approvalMap = {} // tool_call_id → { approvalId, tool }
+    for (const row of rows) {
+      if (row.role !== 'tool') continue
+      try {
+        const parsed = JSON.parse(row.content || '{}')
+        if (parsed.status === 'awaiting_approval' && parsed.approval_id) {
+          approvalMap[row.tool_call_id] = {
+            approvalId: parsed.approval_id,
+            tool: parsed.tool || null,
+          }
+        }
+      } catch {}
+    }
+
+    // Also fetch pending approvals for this instance to get tool + args details
+    let pendingApprovals = {} // approval_id → { tool, tool_args, creation }
+    try {
+      const agentNames = _uiAgents || [contact?.agentName || agentName]
+      for (const an of agentNames) {
+        const pending = await frappe('sena_agents_backend.sena_agents_backend.api.approvals.list_pending', { agent_name: an })
+        for (const a of (pending || [])) {
+          pendingApprovals[a.name] = a
+        }
+      }
+    } catch {}
+
     const uiMsgs = []
     let lastDateLabel = null
 
@@ -483,9 +510,31 @@ async function loadMessages(instanceName, silent = false) {
           })
         } else if (row.content) {
           // Fallback: show agent content if no WA send tool was called — this is an agent note
-          // Check for pending approval ID in the message
-          const approvalMatch = row.content.match(/(?:awaiting\s+(?:human\s+)?approval|approval\s+(?:id|ID))[^a-z0-9]*\(?(?:ID:\s*)?([a-z0-9]+)\)?/i)
-          const hasPendingApproval = !!approvalMatch
+          // Check for pending approval via tool_call_id map (robust) or regex fallback
+          let approvalId = null
+          let approvalDetail = null
+          try {
+            const tc = row.tool_calls ? JSON.parse(row.tool_calls) : null
+            if (tc) {
+              for (const t of tc) {
+                const callId = t.id || ''
+                if (approvalMap[callId]) {
+                  approvalId = approvalMap[callId].approvalId
+                  approvalDetail = pendingApprovals[approvalId] || null
+                  break
+                }
+              }
+            }
+          } catch {}
+          // Regex fallback if tool_call_id didn't match
+          if (!approvalId) {
+            const approvalMatch = row.content.match(/(?:awaiting\s+(?:human\s+)?approval|approval\s+(?:id|ID))[^a-z0-9]*\(?(?:ID:\s*)?([a-z0-9]+)\)?/i)
+            if (approvalMatch) {
+              approvalId = approvalMatch[1]
+              approvalDetail = pendingApprovals[approvalId] || null
+            }
+          }
+          const isPending = approvalId && (pendingApprovals[approvalId] || !approvalDetail)
           uiMsgs.push({
             id: row.name,
             type: 'agent',
@@ -498,10 +547,11 @@ async function loadMessages(instanceName, silent = false) {
             senderName: row.sender_name || displayAgentName,
             delivered: deliveryStatus,
             msgType: isOperatorSender ? 'operator_to_customer' : 'agent_note',
-            approvalId: approvalMatch ? approvalMatch[1] : null,
-            approvalStatus: approvalMatch ? 'pending' : null,
+            approvalId: approvalId || null,
+            approvalStatus: approvalId ? (pendingApprovals[approvalId] ? 'pending' : 'resolved') : null,
+            approvalDetail: approvalDetail || null,
             approvalNote: '',
-            _expanded: hasPendingApproval,
+            _expanded: !!approvalId,
           })
         }
       }
@@ -536,6 +586,7 @@ async function loadMessages(instanceName, silent = false) {
         time: parts[parts.length - 1].time,
         approvalId: approvalPart?.approvalId || null,
         approvalStatus: approvalPart?.approvalStatus || null,
+        approvalDetail: approvalPart?.approvalDetail || null,
         approvalNote: approvalPart?.approvalNote || '',
         agentName: agentPart?.agentName || parts[0].agentName,
         msgType: 'agent_note', // grouped internals render as agent note (left dashed)
@@ -826,6 +877,13 @@ const sendToAgent = async () => {
   } finally {
     sending.value = false
   }
+}
+
+function parseArgs(toolArgs) {
+  try {
+    const parsed = typeof toolArgs === 'string' ? JSON.parse(toolArgs) : toolArgs
+    return typeof parsed === 'object' && parsed !== null ? parsed : {}
+  } catch { return {} }
 }
 
 // ── Inline approval actions ──
@@ -1293,6 +1351,19 @@ watch(selectedContactId, async (id) => {
                 </div>
               <!-- Approval actions if present -->
               <div v-if="msg.approvalId && msg.approvalStatus === 'pending'" class="internal-msg__approval">
+                <div class="approval-detail" v-if="msg.approvalDetail">
+                  <div class="approval-detail__header">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                    <span class="approval-detail__tool">{{ msg.approvalDetail.tool }}</span>
+                    <span class="approval-detail__badge">Pending</span>
+                  </div>
+                  <div class="approval-detail__args" v-if="msg.approvalDetail.tool_args">
+                    <div v-for="(val, key) in parseArgs(msg.approvalDetail.tool_args)" :key="key" class="approval-detail__arg">
+                      <span class="approval-detail__arg-key">{{ key }}:</span>
+                      <span class="approval-detail__arg-val">{{ typeof val === 'string' ? val.slice(0, 120) : JSON.stringify(val).slice(0, 120) }}</span>
+                    </div>
+                  </div>
+                </div>
                 <input v-model="msg.approvalNote" class="approval-note-input" type="text" placeholder="Note (optional)..." @click.stop @keydown.enter.stop="handleApprove(msg)" />
                 <div class="internal-msg__approval-btns">
                   <button class="approval-btn approval-btn--approve" @click.stop="handleApprove(msg)">
@@ -1307,14 +1378,19 @@ watch(selectedContactId, async (id) => {
                 <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View in approvals →</button>
               </div>
               <div v-else-if="msg.approvalId && msg.approvalStatus === 'approved'" class="internal-msg__approval-resolved">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#10B981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
                 <span class="internal-msg__approval-status internal-msg__approval-status--approved">Approved</span>
                 <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View →</button>
               </div>
               <div v-else-if="msg.approvalId && msg.approvalStatus === 'rejected'" class="internal-msg__approval-resolved">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#EF4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
                 <span class="internal-msg__approval-status internal-msg__approval-status--rejected">Rejected</span>
                 <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View →</button>
               </div>
-              <div v-else-if="msg.approvalId && (msg.approvalStatus === 'approving' || msg.approvalStatus === 'rejecting')" class="internal-msg__approval-status">{{ msg.approvalStatus }}...</div>
+              <div v-else-if="msg.approvalId && (msg.approvalStatus === 'approving' || msg.approvalStatus === 'rejecting')" class="internal-msg__approval-resolving">
+                <div class="approval-spinner"></div>
+                <span>{{ msg.approvalStatus === 'approving' ? 'Approving' : 'Rejecting' }}...</span>
+              </div>
               </div>
             </div>
           </div>
@@ -3243,9 +3319,70 @@ watch(selectedContactId, async (id) => {
 
 .internal-msg__approval {
   margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(139, 92, 246, 0.12);
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.approval-detail {
+  background: rgba(139, 92, 246, 0.04);
+  border: 1px solid rgba(139, 92, 246, 0.12);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.approval-detail__header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #7C3AED;
+}
+
+.approval-detail__tool {
+  font-size: 11px;
+  font-weight: 600;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.approval-detail__badge {
+  margin-left: auto;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 10px;
+  background: rgba(245, 158, 11, 0.1);
+  color: #D97706;
+  border: 1px solid rgba(245, 158, 11, 0.2);
+}
+
+.approval-detail__args {
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.approval-detail__arg {
+  display: flex;
+  gap: 4px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.approval-detail__arg-key {
+  color: #7C3AED;
+  font-weight: 500;
+  flex-shrink: 0;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+
+.approval-detail__arg-val {
+  color: #475569;
+  word-break: break-word;
 }
 
 .internal-msg__approval-btns {
@@ -3254,12 +3391,10 @@ watch(selectedContactId, async (id) => {
 }
 
 .internal-msg__approval-status {
-  margin-top: 6px;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #94A3B8;
 }
 
 .internal-msg__approval-status--approved {
@@ -3274,7 +3409,29 @@ watch(selectedContactId, async (id) => {
   margin-top: 6px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+}
+
+.internal-msg__approval-resolving {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #94A3B8;
+}
+
+.approval-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(139, 92, 246, 0.2);
+  border-top-color: #8B5CF6;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 @media (max-width: 768px) {
