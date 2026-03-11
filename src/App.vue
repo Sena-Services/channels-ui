@@ -40,6 +40,10 @@ let _mediaRecorder = null
 let _audioChunks = []
 let _recordingTimer = null
 let _uiAgents = null // cached list of agent names sharing this UI
+let _uiDisplayName = null // display name of the UI (e.g. "WhatsApp Channels")
+const attachedFiles = ref([]) // files staged for upload before sending
+const MAX_ATTACHED_FILES = 5
+const groupMembersMap = ref({}) // phone/lid → name, for mention rendering
 
 // ── Data ──
 const contacts = ref([])
@@ -188,6 +192,7 @@ async function ensureAuth() {
 function formatPhone(instanceId) {
   // std:wa:+919841055201 → +91 98410 55201 (best-effort)
   const raw = instanceId.replace(/^std:wa:/, '')
+  if (raw.startsWith('grp:')) return 'Group'
   if (raw.startsWith('+91') && raw.length >= 13) {
     return `+91 ${raw.slice(3, 8)} ${raw.slice(8)}`
   }
@@ -216,6 +221,13 @@ function avatarColor(str, idx) {
   return avatarColors[idx % avatarColors.length]
 }
 
+function senderColor(name) {
+  if (!name) return '#64748B'
+  let hash = 0
+  for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash)
+  return avatarColors[Math.abs(hash) % avatarColors.length]
+}
+
 // ── Load instances (sidebar contacts) ──
 async function loadInstances(silent = false) {
   if (!silent) loading.value = true
@@ -234,6 +246,7 @@ async function loadInstances(silent = false) {
           uiName = cur?.ui
         }
         if (uiName) {
+          _uiDisplayName = uiName
           const agents = await frappe('frappe.client.get_list', {
             doctype: 'Runtime Agent',
             filters: [['ui', '=', uiName], ['enabled', '=', 1]],
@@ -289,9 +302,12 @@ async function loadInstances(silent = false) {
 
     contacts.value = (rows || []).map((row, idx) => {
       const phone = formatPhone(row.instance_id)
+      const isGroupInstance = row.instance_id.startsWith('std:wa:grp:')
       // Prefer sender_name from messages, then instance title (updated by webhook), then phone
       const titleName = (row.title && !row.title.startsWith('WhatsApp: +') && row.title !== phone) ? row.title : ''
-      const displayName = senderNames[row.name] || existingNames[row.name] || titleName || phone
+      const displayName = isGroupInstance
+        ? (titleName || 'Group Chat')
+        : (senderNames[row.name] || existingNames[row.name] || titleName || phone)
       return {
         id: row.name,           // instance name (doc id)
         instanceId: row.instance_id,
@@ -307,6 +323,7 @@ async function loadInstances(silent = false) {
         agentName: row.agent_name || '',
         lastActivity: row.last_activity,
         messageCount: row.message_count || 0,
+        isGroup: isGroupInstance,
       }
     })
 
@@ -371,6 +388,44 @@ async function loadMessages(instanceName, silent = false) {
       }
     } catch {}
 
+    // Detect rejected approvals by walking messages in order.
+    // Single FIFO queue of approval_ids (awaiting_approval has no tool field).
+    // [System] granted/denied messages consume them in chronological order.
+    const rejectedToolCalls = new Set()
+    try {
+      const approvalIdToCallId = {}
+      for (const [callId, info] of Object.entries(approvalMap)) {
+        approvalIdToCallId[info.approvalId] = callId
+      }
+      const deniedApprovalIds = new Set()
+      const unresolvedQueue = [] // approval_id in chronological order
+      for (const row of rows) {
+        if (row.role === 'tool') {
+          try {
+            const parsed = JSON.parse(row.content || '{}')
+            if (parsed.status === 'awaiting_approval' && parsed.approval_id) {
+              unresolvedQueue.push(parsed.approval_id)
+            }
+          } catch {}
+        }
+        if (row.role === 'user') {
+          const c = row.content || ''
+          if (/\[System\] Approval granted for /.test(c)) {
+            if (unresolvedQueue.length > 0) unresolvedQueue.shift()
+          }
+          if (/\[System\] Approval denied for your /.test(c)) {
+            if (unresolvedQueue.length > 0) deniedApprovalIds.add(unresolvedQueue.shift())
+          }
+        }
+      }
+      for (const aid of deniedApprovalIds) {
+        const callId = approvalIdToCallId[aid]
+        if (callId) rejectedToolCalls.add(callId)
+      }
+    } catch (e) {
+      console.warn('[channels-ui] rejection detection error:', e)
+    }
+
     const uiMsgs = []
     let lastDateLabel = null
 
@@ -392,20 +447,31 @@ async function loadMessages(instanceName, silent = false) {
         const rawText = row.content || ''
         const cleanText = rawText.split('\n---\n')[0].replace(/\s*\[WhatsApp from[^\]]*\].*$/s, '').trim()
         const isOperatorInstruction = row.sender_name === 'Operator' || (!rawText.includes('[WhatsApp from'))
+
+        // Strip [SenderName] prefix from group messages for cleaner display
+        let displayText = cleanText
+        let groupSenderName = row.sender_name || ''
+        const grpPrefixMatch = cleanText.match(/^\[([^\]]+)\]\s*/)
+        if (grpPrefixMatch) {
+          groupSenderName = grpPrefixMatch[1]
+          displayText = cleanText.slice(grpPrefixMatch[0].length)
+        }
+
         uiMsgs.push({
           id: row.name,
           type: 'text',
-          text: cleanText,
+          text: displayText,
           sender: 'user',
           time: timeStr,
           read: true,
-          senderName: row.sender_name || '',
+          senderName: groupSenderName,
           msgType: isOperatorInstruction ? 'operator_instruction' : 'customer_in',
         })
       } else if (row.role === 'assistant') {
         let toolLabel = null
         let sentText = null
         let sentVoice = null
+        let sentMedia = null
 
         try {
           const tc = row.tool_calls ? JSON.parse(row.tool_calls) : null
@@ -420,6 +486,12 @@ async function loadMessages(instanceName, silent = false) {
                 sentText = args.message || args.text || null
               } else if (name === 'whatsapp_send_voice_note') {
                 sentVoice = args.text || args.message || null
+              } else if (name === 'whatsapp_send_media') {
+                sentMedia = {
+                  url: args.media_url || '',
+                  type: args.media_type || 'document',
+                  caption: args.caption || '',
+                }
               }
             }
           }
@@ -487,6 +559,7 @@ async function loadMessages(instanceName, silent = false) {
           // Check if this whatsapp_send is pending approval
           let sentApprovalId = null
           let sentApprovalDetail = null
+          let wasRejected = false
           try {
             const tc = row.tool_calls ? JSON.parse(row.tool_calls) : null
             if (tc) {
@@ -495,15 +568,20 @@ async function loadMessages(instanceName, silent = false) {
                 if (approvalMap[callId]) {
                   sentApprovalId = approvalMap[callId].approvalId
                   sentApprovalDetail = pendingApprovals[sentApprovalId] || null
+                  if (rejectedToolCalls.has(callId)) wasRejected = true
                   break
                 }
               }
             }
           } catch {}
 
+          // Rejected tool calls render as internal notes, not customer messages
+          const sentMsgType = wasRejected ? 'agent_note'
+            : (isOperatorSender ? 'operator_to_customer' : 'agent_to_customer')
+
           uiMsgs.push({
             id: row.name,
-            type: 'agent',
+            type: wasRejected ? 'agent' : 'agent',
             text: sentText,
             sender: 'agent',
             time: timeStr,
@@ -511,10 +589,10 @@ async function loadMessages(instanceName, silent = false) {
             agentName: displayAgentName,
             agentTool: toolLabel || null,
             senderName: row.sender_name || displayAgentName,
-            delivered: sentApprovalId ? 'pending_approval' : deliveryStatus,
-            msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
+            delivered: wasRejected ? 'rejected' : (sentApprovalId ? 'pending_approval' : deliveryStatus),
+            msgType: sentMsgType,
             approvalId: sentApprovalId || null,
-            approvalStatus: sentApprovalId ? (pendingApprovals[sentApprovalId] ? 'pending' : 'resolved') : null,
+            approvalStatus: wasRejected ? 'rejected' : (sentApprovalId ? (pendingApprovals[sentApprovalId] ? 'pending' : 'resolved') : null),
             approvalDetail: sentApprovalDetail || null,
             approvalNote: '',
             _expanded: !!sentApprovalId,
@@ -523,6 +601,7 @@ async function loadMessages(instanceName, silent = false) {
           // Check if this whatsapp_send_voice_note is pending approval
           let voiceApprovalId = null
           let voiceApprovalDetail = null
+          let voiceRejected = false
           try {
             const tc = row.tool_calls ? JSON.parse(row.tool_calls) : null
             if (tc) {
@@ -531,11 +610,15 @@ async function loadMessages(instanceName, silent = false) {
                 if (approvalMap[callId]) {
                   voiceApprovalId = approvalMap[callId].approvalId
                   voiceApprovalDetail = pendingApprovals[voiceApprovalId] || null
+                  if (rejectedToolCalls.has(callId)) voiceRejected = true
                   break
                 }
               }
             }
           } catch {}
+
+          const voiceMsgType = voiceRejected ? 'agent_note'
+            : (isOperatorSender ? 'operator_to_customer' : 'agent_to_customer')
 
           uiMsgs.push({
             id: row.name,
@@ -546,14 +629,51 @@ async function loadMessages(instanceName, silent = false) {
             isAI: true,
             agentName: displayAgentName,
             senderName: row.sender_name || displayAgentName,
-            delivered: voiceApprovalId ? 'pending_approval' : deliveryStatus,
-            msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
+            delivered: voiceRejected ? 'rejected' : (voiceApprovalId ? 'pending_approval' : deliveryStatus),
+            msgType: voiceMsgType,
             approvalId: voiceApprovalId || null,
-            approvalStatus: voiceApprovalId ? (pendingApprovals[voiceApprovalId] ? 'pending' : 'resolved') : null,
+            approvalStatus: voiceRejected ? 'rejected' : (voiceApprovalId ? (pendingApprovals[voiceApprovalId] ? 'pending' : 'resolved') : null),
             approvalDetail: voiceApprovalDetail || null,
             approvalNote: '',
             _expanded: !!voiceApprovalId,
           })
+        } else if (sentMedia) {
+          // Media sent via whatsapp_send_media — render as image/document bubble
+          const mediaType = sentMedia.type === 'image' ? 'image' : (sentMedia.type === 'video' ? 'video' : 'document')
+          // Resolve /files/ URLs for display — agent may pass relative or wrong-domain URLs
+          let mediaUrl = sentMedia.url
+          if (mediaUrl && mediaUrl.includes('/files/')) {
+            const filePart = '/files/' + mediaUrl.split('/files/').pop()
+            mediaUrl = window.location.origin + filePart
+          } else if (mediaUrl && mediaUrl.startsWith('/')) {
+            mediaUrl = window.location.origin + mediaUrl
+          }
+          if (mediaType === 'image') {
+            uiMsgs.push({
+              id: row.name,
+              type: 'image',
+              imageUrl: mediaUrl,
+              caption: sentMedia.caption || null,
+              sender: 'agent',
+              time: timeStr,
+              senderName: row.sender_name || displayAgentName,
+              delivered: deliveryStatus,
+              msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
+            })
+          } else {
+            const fileName = mediaUrl.split('/').pop() || 'file'
+            uiMsgs.push({
+              id: row.name,
+              type: 'document',
+              filename: fileName,
+              fileUrl: mediaUrl,
+              sender: 'agent',
+              time: timeStr,
+              senderName: row.sender_name || displayAgentName,
+              delivered: deliveryStatus,
+              msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
+            })
+          }
         } else if (row.content) {
           // Fallback: show agent content if no WA send tool was called — this is an agent note
           // Check for pending approval via tool_call_id map (robust) or regex fallback
@@ -654,9 +774,12 @@ async function loadMessages(instanceName, silent = false) {
       contact.lastMsg = prefix + preview
     }
     // Update contact display name from sender_name if available (skip Operator — that's internal)
-    const lastUserMsg = reversed.find(r => r.role === 'user' && r.sender_name && r.sender_name !== 'Operator')
-    if (lastUserMsg?.sender_name && contact) {
-      contact.name = lastUserMsg.sender_name
+    // Don't update name for group instances — groups have multiple senders
+    if (!contact?.isGroup) {
+      const lastUserMsg = reversed.find(r => r.role === 'user' && r.sender_name && r.sender_name !== 'Operator')
+      if (lastUserMsg?.sender_name && contact) {
+        contact.name = lastUserMsg.sender_name
+      }
     }
 
     const prevCount = messagesCache.value[instanceName]?.length || 0
@@ -706,9 +829,19 @@ const filteredContacts = computed(() => {
 // ── Render helpers ──
 const renderText = (text) => {
   if (!text) return ''
-  return text
+  let html = text
     .replace(/\*(.*?)\*/g, '<strong>$1</strong>')
     .replace(/_(.*?)_/g, '<em>$1</em>')
+  // Resolve @mentions: @NUMBER → @Name in blue
+  const map = groupMembersMap.value
+  if (map && Object.keys(map).length > 0) {
+    html = html.replace(/@(\d{5,20})/g, (match, num) => {
+      const name = map[num]
+      if (name) return `<span style="color:#1d4ed8;font-weight:500">@${name}</span>`
+      return match
+    })
+  }
+  return html
 }
 
 const scrollToBottom = () => {
@@ -726,6 +859,30 @@ const selectContact = async (id) => {
   if (isMobile.value) mobileShowChat.value = true
   await loadMessages(id)
   scrollToBottom()
+  // Fetch group members for mention rendering
+  if (id && id.startsWith('std:wa:grp:')) {
+    fetchGroupMembers(id)
+  }
+}
+
+const fetchGroupMembers = async (instanceId) => {
+  try {
+    const resp = await frappe('sena_whatsapp.api.whatsapp.get_group_members', { instance_id: instanceId })
+    const members = resp.members || []
+    const map = {}
+    for (const m of members) {
+      const name = m.name || ''
+      if (!name) continue
+      if (m.phone) map[m.phone] = name
+      if (m.lid) map[m.lid] = name
+      // Also map JID prefix (before @)
+      if (m.jid) map[m.jid.split('@')[0]] = name
+    }
+    groupMembersMap.value = map
+  } catch (e) {
+    console.warn('[channels-ui] Failed to fetch group members:', e)
+    groupMembersMap.value = {}
+  }
 }
 
 const mobileBack = () => {
@@ -814,6 +971,33 @@ const pendingDeleteId = ref(null)
 function deleteChat(instanceId) {
   // First call → show confirmation; second call (from confirm button) → execute
   pendingDeleteId.value = instanceId
+}
+
+const pendingClearId = ref(null)
+
+function clearChat(instanceId) {
+  pendingClearId.value = instanceId
+}
+
+async function confirmClearChat() {
+  const instanceId = pendingClearId.value
+  pendingClearId.value = null
+  if (!instanceId) return
+  const contact = contacts.value.find(c => c.id === instanceId)
+  try {
+    await frappe('sena_agents_backend.sena_agents_backend.api.memory.clear_history', {
+      agent_name: contact?.agentName || agentName || '',
+      instance_id: contact?.instanceId || instanceId,
+    })
+    // Clear local cache but keep the contact
+    messagesCache.value[instanceId] = []
+    if (contact) {
+      contact.lastMsg = '0 messages'
+      contact.messageCount = 0
+    }
+  } catch (e) {
+    console.error('[channels-ui] clearChat failed:', e)
+  }
 }
 
 async function confirmDeleteChat() {
@@ -980,7 +1164,34 @@ function openApprovalInPanel(approvalId) {
   }, '*')
 }
 
-const handleSend = () => {
+const handleSend = async () => {
+  const hasFiles = attachedFiles.value.length > 0
+  const hasText = messageInput.value.trim()
+  if (!hasFiles && !hasText) return
+
+  const id = selectedContactId.value
+  if (!id) return
+
+  // Upload files first if any
+  if (hasFiles) {
+    sending.value = true
+    try {
+      await uploadAttachedFiles(id)
+    } catch (e) {
+      console.error('[channels-ui] File upload error:', e)
+      sending.value = false
+      return
+    }
+    // If no text, just refresh and return
+    if (!hasText) {
+      sending.value = false
+      try { await loadMessages(id, true); scrollToBottom() } catch {}
+      return
+    }
+    sending.value = false
+  }
+
+  // Send text message
   if (sendMode.value === 'agent') {
     sendToAgent()
   } else {
@@ -992,24 +1203,40 @@ const triggerFileUpload = () => {
   if (fileInputRef.value) fileInputRef.value.click()
 }
 
-const handleFileUpload = async (event) => {
-  const file = event.target.files?.[0]
-  if (!file || !selectedContactId.value) return
-  const id = selectedContactId.value
-  sending.value = true
+const handleFileUpload = (event) => {
+  const files = Array.from(event.target.files || [])
+  if (!files.length) return
+  const remaining = MAX_ATTACHED_FILES - attachedFiles.value.length
+  attachedFiles.value = [...attachedFiles.value, ...files.slice(0, remaining)].slice(0, MAX_ATTACHED_FILES)
+  if (fileInputRef.value) fileInputRef.value.value = ''
+}
 
-  try {
+const removeAttachedFile = (idx) => {
+  attachedFiles.value.splice(idx, 1)
+}
+
+const getFilePreviewUrl = (file) => {
+  if (file.type?.startsWith('image/')) return URL.createObjectURL(file)
+  return null
+}
+
+const truncateFilename = (name, max = 18) => {
+  if (name.length <= max) return name
+  const ext = name.lastIndexOf('.') > 0 ? name.slice(name.lastIndexOf('.')) : ''
+  return name.slice(0, max - ext.length - 2) + '..' + ext
+}
+
+const uploadAttachedFiles = async (instanceId) => {
+  const headers = { Accept: 'application/json' }
+  if (_csrfToken) headers['X-Frappe-CSRF-Token'] = _csrfToken
+
+  for (const file of attachedFiles.value) {
     const formData = new FormData()
     formData.append('file', file)
-    formData.append('instance_id', id)
-    // Inject sid for auth (cookies may not work in iframe context)
+    formData.append('instance_id', instanceId)
     if (_sid) formData.append('sid', _sid)
 
-    const headers = { Accept: 'application/json' }
-    if (_csrfToken) headers['X-Frappe-CSRF-Token'] = _csrfToken
-
-    console.log('[channels-ui] Uploading file:', file.name, file.type, file.size, 'to', id)
-
+    console.log('[channels-ui] Uploading file:', file.name, file.type, file.size)
     const resp = await fetch('/api/method/sena_whatsapp.api.whatsapp.send_direct_media', {
       method: 'POST',
       headers,
@@ -1020,15 +1247,8 @@ const handleFileUpload = async (event) => {
     console.log('[channels-ui] Upload response:', resp.status, data)
     if (!resp.ok) throw new Error(data.exception || data.exc || `HTTP ${resp.status}`)
     if (data.message?.status === 'error') throw new Error(data.message.error)
-    await loadMessages(id, true)
-    scrollToBottom()
-  } catch (e) {
-    console.error('[channels-ui] File upload failed:', e)
-    alert('File upload failed: ' + (e.message || e))
-  } finally {
-    sending.value = false
-    if (fileInputRef.value) fileInputRef.value.value = ''
   }
+  attachedFiles.value = []
 }
 
 const startRecording = async () => {
@@ -1276,7 +1496,10 @@ watch(selectedContactId, async (id) => {
           @click="selectContact(contact.id)"
         >
           <div class="contact__avatar" :style="{ background: contact.color }">
-            {{ contact.name[0] }}
+            <template v-if="contact.isGroup">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            </template>
+            <template v-else>{{ contact.name[0] }}</template>
             <div v-if="contact.online" class="contact__online"></div>
           </div>
           <div class="contact__body">
@@ -1288,7 +1511,7 @@ watch(selectedContactId, async (id) => {
               <span class="contact__preview">{{ contact.lastMsg }}</span>
               <span v-if="contact.unread" class="contact__unread">{{ contact.unread }}</span>
             </div>
-            <div v-if="contact.name !== contact.phone" class="contact__row2">
+            <div v-if="!contact.isGroup && contact.name !== contact.phone" class="contact__row2">
               <span class="contact__preview" style="font-size: 10px; color: #94A3B8;">{{ contact.phone }}</span>
             </div>
             <div class="contact__row3">
@@ -1321,6 +1544,17 @@ watch(selectedContactId, async (id) => {
       </div>
     </div>
 
+    <!-- Clear messages confirmation overlay -->
+    <div v-if="pendingClearId" class="confirm-overlay" @click="pendingClearId = null">
+      <div class="confirm-dialog" @click.stop>
+        <p class="confirm-dialog__text">Clear all messages? The conversation will remain but history will be erased.</p>
+        <div class="confirm-dialog__btns">
+          <button class="confirm-dialog__btn confirm-dialog__btn--cancel" @click="pendingClearId = null">Cancel</button>
+          <button class="confirm-dialog__btn confirm-dialog__btn--delete" @click="confirmClearChat">Clear</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ===== CHAT ===== -->
     <main class="chat" :class="{ 'chat--visible': !isMobile || mobileShowChat }" v-if="selectedContact || (isMobile && mobileShowChat)">
 
@@ -1333,36 +1567,35 @@ watch(selectedContactId, async (id) => {
             </svg>
           </button>
           <div class="chat__avatar" :style="{ background: selectedContact?.color }">
-            {{ selectedContact.name[0] }}
+            <template v-if="selectedContact?.isGroup">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+            </template>
+            <template v-else>{{ selectedContact.name[0] }}</template>
             <div v-if="selectedContact.online" class="chat__avatar-online"></div>
           </div>
           <div class="chat__header-info">
             <div class="chat__header-name">{{ selectedContact.name }}</div>
             <div class="chat__header-sub">
-              <span class="chat__header-company">{{ selectedContact.company }}</span>
+              <span class="chat__header-agent-tag">{{ selectedContact.company }}</span>
               <span class="chat__header-dot">·</span>
               <span class="chat__header-status" v-if="selectedContact.online">online</span>
               <span class="chat__header-status" v-else>last seen recently</span>
             </div>
           </div>
         </div>
+        <div class="chat__header-filters">
+          <button
+            v-for="f in [{ id: 'all', label: 'All' }, { id: 'customer', label: 'Customer' }, { id: 'internal', label: 'Internal' }]"
+            :key="f.id"
+            class="filter-pill"
+            :class="{ 'filter-pill--active': messageFilter === f.id }"
+            @click="messageFilter = f.id; if (f.id === 'customer') sendMode = 'customer'; else if (f.id === 'internal') sendMode = 'agent'"
+          >{{ f.label }}</button>
+        </div>
         <div class="chat__header-actions">
           <span class="chat__status-dot" :class="{ 'chat__status-dot--active': selectedContact.status === 'Active' }"></span>
-          <button class="chat__header-btn">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></svg>
-          </button>
+          <button class="chat__clear-btn" @click="clearChat(selectedContact.id)">Clear</button>
         </div>
-      </div>
-
-      <!-- Message filter bar -->
-      <div class="chat__filter-bar">
-        <button
-          v-for="f in [{ id: 'all', label: 'All' }, { id: 'customer', label: 'Customer' }, { id: 'internal', label: 'Internal' }]"
-          :key="f.id"
-          class="filter-pill"
-          :class="{ 'filter-pill--active': messageFilter === f.id }"
-          @click="messageFilter = f.id; if (f.id === 'customer') sendMode = 'customer'; else if (f.id === 'internal') sendMode = 'agent'"
-        >{{ f.label }}</button>
       </div>
 
       <!-- Messages -->
@@ -1391,7 +1624,7 @@ watch(selectedContactId, async (id) => {
           <!-- Customer message (left) -->
           <div v-else-if="msg.type === 'text' && msg.sender === 'user' && msg.msgType !== 'operator_instruction'" class="msg msg--in">
             <div class="msg__wrapper">
-              <span v-if="msg.senderName" class="bubble__sender-label">{{ msg.senderName }}</span>
+              <span v-if="msg.senderName" class="bubble__sender-label" :style="{ color: senderColor(msg.senderName) }">{{ msg.senderName }}</span>
               <div class="bubble bubble--customer">
                 <div class="bubble__text" v-html="renderText(msg.text)"></div>
                 <div class="bubble__meta">
@@ -1448,11 +1681,7 @@ watch(selectedContactId, async (id) => {
                 <span class="internal-msg__approval-status internal-msg__approval-status--approved">Approved</span>
                 <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View →</button>
               </div>
-              <div v-else-if="msg.approvalId && msg.approvalStatus === 'rejected'" class="internal-msg__approval-resolved">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#EF4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-                <span class="internal-msg__approval-status internal-msg__approval-status--rejected">Rejected</span>
-                <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View →</button>
-              </div>
+              <!-- Rejected approvals: no badge needed, message is already shown as internal -->
               <div v-else-if="msg.approvalId && (msg.approvalStatus === 'approving' || msg.approvalStatus === 'rejecting')" class="internal-msg__approval-resolving">
                 <div class="approval-spinner"></div>
                 <span>{{ msg.approvalStatus === 'approving' ? 'Approving' : 'Rejecting' }}...</span>
@@ -1622,7 +1851,7 @@ watch(selectedContactId, async (id) => {
       </div>
 
       <!-- Input bar -->
-      <input type="file" ref="fileInputRef" style="display:none" @change="handleFileUpload" accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx" />
+      <input type="file" ref="fileInputRef" style="display:none" @change="handleFileUpload" accept="image/*,video/*,audio/*,.pdf,.doc,.docx,.xls,.xlsx" multiple />
 
       <!-- Recording overlay -->
       <div v-if="isRecording" class="chat__input-bar chat__input-bar--recording">
@@ -1638,8 +1867,19 @@ watch(selectedContactId, async (id) => {
         </button>
       </div>
 
+      <!-- Attachment preview strip -->
+      <div v-if="attachedFiles.length > 0 && !isRecording" class="chat__attachments-strip">
+        <div v-for="(file, idx) in attachedFiles" :key="idx" class="attach-chip">
+          <img v-if="file.type?.startsWith('image/')" :src="getFilePreviewUrl(file)" class="attach-chip__thumb" />
+          <svg v-else class="attach-chip__icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <span class="attach-chip__name">{{ truncateFilename(file.name) }}</span>
+          <button class="attach-chip__remove" @click="removeAttachedFile(idx)">&times;</button>
+        </div>
+        <button v-if="attachedFiles.length < MAX_ATTACHED_FILES" class="attach-chip attach-chip--add" @click="triggerFileUpload">+</button>
+      </div>
+
       <!-- Normal input bar -->
-      <div v-else class="chat__input-bar" :class="sendMode === 'agent' ? 'chat__input-bar--agent' : ''">
+      <div v-if="!isRecording" class="chat__input-bar" :class="sendMode === 'agent' ? 'chat__input-bar--agent' : ''">
         <!-- Send mode toggle pill -->
         <button
           class="mode-pill"
@@ -1666,7 +1906,7 @@ watch(selectedContactId, async (id) => {
           />
         </div>
         <!-- Show send button when there's text, mic button when empty (customer mode only) -->
-        <button v-if="messageInput.trim()" class="input-btn input-btn--send" @click="handleSend" :disabled="sending">
+        <button v-if="messageInput.trim() || attachedFiles.length > 0" class="input-btn input-btn--send" @click="handleSend" :disabled="sending">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
         </button>
         <button v-else-if="sendMode === 'customer'" class="input-btn input-btn--mic" @click="startRecording" :disabled="sending">
@@ -2245,6 +2485,7 @@ watch(selectedContactId, async (id) => {
   justify-content: space-between;
   padding: 8px 14px;
   background: #F8F7F4;
+  position: relative;
   border-bottom: 1px solid rgba(0,0,0,0.06);
   flex-shrink: 0;
   z-index: 1;
@@ -2300,6 +2541,15 @@ watch(selectedContactId, async (id) => {
   color: #64748B;
 }
 
+.chat__header-agent-tag {
+  font-size: 10px;
+  color: #6366F1;
+  background: #EEF2FF;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
 .chat__header-dot {
   color: #94A3B8;
   font-size: 11px;
@@ -2333,6 +2583,23 @@ watch(selectedContactId, async (id) => {
 .chat__header-btn:hover {
   background: rgba(0,0,0,0.04);
   color: #64748B;
+}
+
+.chat__clear-btn {
+  font-size: 11px;
+  font-weight: 500;
+  color: #94A3B8;
+  background: none;
+  border: 1px solid rgba(148,163,184,0.3);
+  border-radius: 5px;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.chat__clear-btn:hover {
+  color: #EF4444;
+  border-color: rgba(239,68,68,0.3);
+  background: rgba(239,68,68,0.04);
 }
 
 /* Status dot in header */
@@ -2816,6 +3083,64 @@ watch(selectedContactId, async (id) => {
   30% { opacity: 1; transform: scale(1); }
 }
 
+/* ===== ATTACHMENT PREVIEW STRIP ===== */
+.chat__attachments-strip {
+  display: flex;
+  gap: 6px;
+  padding: 6px 12px 0;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+.attach-chip {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #475569;
+  max-width: 160px;
+}
+.attach-chip__thumb {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+.attach-chip__icon {
+  flex-shrink: 0;
+  color: #94a3b8;
+}
+.attach-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attach-chip__remove {
+  background: none;
+  border: none;
+  color: #94a3b8;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 2px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.attach-chip__remove:hover { color: #ef4444; }
+.attach-chip--add {
+  background: none;
+  border: 1px dashed #cbd5e1;
+  color: #94a3b8;
+  cursor: pointer;
+  font-size: 16px;
+  justify-content: center;
+  min-width: 32px;
+}
+.attach-chip--add:hover { border-color: #94a3b8; color: #64748b; }
+
 /* ===== INPUT BAR — Sena ChatInput elevated ===== */
 .chat__input-bar {
   display: flex;
@@ -3144,8 +3469,18 @@ watch(selectedContactId, async (id) => {
 }
 
 /* ===== MESSAGE FILTER BAR ===== */
-.chat__filter-bar {
+.chat__header-filters {
   display: flex;
+  align-items: center;
+  gap: 4px;
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+/* DEPRECATED — kept for reference, now inline in header */
+.chat__filter-bar {
+  display: none;
   align-items: center;
   gap: 6px;
   padding: 6px 14px;
