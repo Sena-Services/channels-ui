@@ -44,6 +44,8 @@ let _uiAgents = null // cached list of agent names sharing this UI
 // ── Data ──
 const contacts = ref([])
 const messagesCache = ref({}) // instanceName → array of UI message objects
+const agentThinking = ref(false) // true when agent is actively processing
+let _thinkingTimeout = null
 
 const avatarColors = ['#3B82F6', '#8B5CF6', '#EC4899', '#F59E0B', '#10B981', '#06B6D4', '#EF4444', '#6366F1']
 
@@ -1108,6 +1110,25 @@ async function _handleParentMessage(event) {
     }
   } else if (msg.type === 'wa_instance_update') {
     await loadInstances(true)
+  } else if (msg.type === 'agent_token' || msg.type === 'agent_tool_call') {
+    // Agent is actively streaming/working — show thinking indicator
+    const agentNames = _uiAgents || [agentName]
+    if (agentNames.includes(msg.agent_name)) {
+      agentThinking.value = true
+      clearTimeout(_thinkingTimeout)
+      _thinkingTimeout = setTimeout(() => { agentThinking.value = false }, 8000)
+    }
+  } else if (msg.type === 'agent_done') {
+    const agentNames = _uiAgents || [agentName]
+    if (agentNames.includes(msg.agent_name)) {
+      agentThinking.value = false
+      clearTimeout(_thinkingTimeout)
+      // Reload messages after agent finishes
+      if (selectedContactId.value) {
+        setTimeout(() => loadMessages(selectedContactId.value, true), 500)
+      }
+      await loadInstances(true)
+    }
   }
 }
 
@@ -1494,6 +1515,14 @@ watch(selectedContactId, async (id) => {
             <span></span><span></span><span></span>
           </div>
         </div>
+      </div>
+
+      <!-- Agent thinking indicator -->
+      <div v-if="agentThinking" class="chat__thinking">
+        <div class="thinking-dots">
+          <span></span><span></span><span></span>
+        </div>
+        <span class="thinking-label">{{ selectedContact?.agentName || 'Agent' }} is thinking...</span>
       </div>
 
       <!-- Input bar -->
@@ -2618,6 +2647,44 @@ watch(selectedContactId, async (id) => {
 .doc__dl:hover {
   background: rgba(0,0,0,0.04);
   color: #64748B;
+}
+
+/* ===== THINKING INDICATOR ===== */
+.chat__thinking {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  background: rgba(99, 102, 241, 0.04);
+  border-top: 1px solid rgba(99, 102, 241, 0.08);
+}
+
+.thinking-label {
+  font-size: 11px;
+  color: #6366F1;
+  font-weight: 500;
+}
+
+.thinking-dots {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+
+.thinking-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #6366F1;
+  animation: thinking-bounce 1.2s ease-in-out infinite;
+}
+
+.thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes thinking-bounce {
+  0%, 60%, 100% { opacity: 0.3; transform: scale(0.8); }
+  30% { opacity: 1; transform: scale(1); }
 }
 
 /* ===== INPUT BAR — Sena ChatInput elevated ===== */
