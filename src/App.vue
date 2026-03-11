@@ -266,7 +266,7 @@ async function loadInstances(silent = false) {
         try {
           const userMsgs = await frappe('frappe.client.get_list', {
             doctype: 'Runtime Message',
-            filters: [['instance', '=', row.name], ['role', '=', 'user'], ['sender_name', 'is', 'set']],
+            filters: [['instance', '=', row.name], ['role', '=', 'user'], ['sender_name', 'is', 'set'], ['sender_name', '!=', 'Operator']],
             fields: ['sender_name'],
             order_by: 'creation desc',
             limit_page_length: 1,
@@ -484,6 +484,23 @@ async function loadMessages(instanceName, silent = false) {
         }
 
         if (sentText) {
+          // Check if this whatsapp_send is pending approval
+          let sentApprovalId = null
+          let sentApprovalDetail = null
+          try {
+            const tc = row.tool_calls ? JSON.parse(row.tool_calls) : null
+            if (tc) {
+              for (const t of tc) {
+                const callId = t.id || ''
+                if (approvalMap[callId]) {
+                  sentApprovalId = approvalMap[callId].approvalId
+                  sentApprovalDetail = pendingApprovals[sentApprovalId] || null
+                  break
+                }
+              }
+            }
+          } catch {}
+
           uiMsgs.push({
             id: row.name,
             type: 'agent',
@@ -494,10 +511,32 @@ async function loadMessages(instanceName, silent = false) {
             agentName: displayAgentName,
             agentTool: toolLabel || null,
             senderName: row.sender_name || displayAgentName,
-            delivered: deliveryStatus,
+            delivered: sentApprovalId ? 'pending_approval' : deliveryStatus,
             msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
+            approvalId: sentApprovalId || null,
+            approvalStatus: sentApprovalId ? (pendingApprovals[sentApprovalId] ? 'pending' : 'resolved') : null,
+            approvalDetail: sentApprovalDetail || null,
+            approvalNote: '',
+            _expanded: !!sentApprovalId,
           })
         } else if (sentVoice) {
+          // Check if this whatsapp_send_voice_note is pending approval
+          let voiceApprovalId = null
+          let voiceApprovalDetail = null
+          try {
+            const tc = row.tool_calls ? JSON.parse(row.tool_calls) : null
+            if (tc) {
+              for (const t of tc) {
+                const callId = t.id || ''
+                if (approvalMap[callId]) {
+                  voiceApprovalId = approvalMap[callId].approvalId
+                  voiceApprovalDetail = pendingApprovals[voiceApprovalId] || null
+                  break
+                }
+              }
+            }
+          } catch {}
+
           uiMsgs.push({
             id: row.name,
             type: 'voice',
@@ -507,8 +546,13 @@ async function loadMessages(instanceName, silent = false) {
             isAI: true,
             agentName: displayAgentName,
             senderName: row.sender_name || displayAgentName,
-            delivered: deliveryStatus,
+            delivered: voiceApprovalId ? 'pending_approval' : deliveryStatus,
             msgType: isOperatorSender ? 'operator_to_customer' : 'agent_to_customer',
+            approvalId: voiceApprovalId || null,
+            approvalStatus: voiceApprovalId ? (pendingApprovals[voiceApprovalId] ? 'pending' : 'resolved') : null,
+            approvalDetail: voiceApprovalDetail || null,
+            approvalNote: '',
+            _expanded: !!voiceApprovalId,
           })
         } else if (row.content) {
           // Fallback: show agent content if no WA send tool was called — this is an agent note
@@ -609,8 +653,8 @@ async function loadMessages(instanceName, silent = false) {
       const prefix = ''
       contact.lastMsg = prefix + preview
     }
-    // Update contact display name from sender_name if available
-    const lastUserMsg = reversed.find(r => r.role === 'user')
+    // Update contact display name from sender_name if available (skip Operator — that's internal)
+    const lastUserMsg = reversed.find(r => r.role === 'user' && r.sender_name && r.sender_name !== 'Operator')
     if (lastUserMsg?.sender_name && contact) {
       contact.name = lastUserMsg.sender_name
     }
@@ -865,6 +909,7 @@ const sendToAgent = async () => {
       agent_name: targetAgent,
       instance_id: instanceId,
       message: text,
+      sender_name: 'Operator',
     })
     // Reload to get persisted state
     await loadMessages(id, true)
@@ -1420,21 +1465,72 @@ watch(selectedContactId, async (id) => {
           <div v-else-if="msg.type === 'agent' && (msg.msgType === 'agent_to_customer' || msg.msgType === 'operator_to_customer')" class="msg msg--out">
             <div class="msg__wrapper">
               <span class="msg__sender-label msg__sender-label--agent">{{ msg.msgType === 'operator_to_customer' ? 'You' : msg.agentName }}</span>
-              <div class="bubble bubble--agent-to-customer">
+              <div class="bubble bubble--agent-to-customer" :class="{ 'bubble--pending-approval': msg.approvalId && msg.approvalStatus === 'pending' }">
                 <div class="bubble__text" v-html="renderText(msg.text)"></div>
                 <div class="bubble__meta">
                   <span class="bubble__time">{{ msg.time }}</span>
-                  <svg class="bubble__wa-icon" width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
-                  <span class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.delivered === 'read', 'bubble__ticks--delivered': msg.delivered === 'delivered' }">
-                    <svg v-if="msg.delivered === 'sent'" width="14" height="10" viewBox="0 0 14 10" fill="none">
-                      <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                    </svg>
-                    <svg v-else width="14" height="10" viewBox="0 0 14 10" fill="none">
-                      <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                      <path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-                    </svg>
-                  </span>
+                  <!-- Pending approval: show clock icon + badge instead of delivery ticks -->
+                  <template v-if="msg.approvalId && (msg.approvalStatus === 'pending' || msg.approvalStatus === 'approving' || msg.approvalStatus === 'rejecting')">
+                    <span class="bubble__approval-badge">
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                      Pending
+                    </span>
+                  </template>
+                  <!-- Normal delivery: WA icon + ticks -->
+                  <template v-else>
+                    <svg class="bubble__wa-icon" width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 01-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 01-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 012.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0012.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 005.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 00-3.48-8.413z"/></svg>
+                    <span class="bubble__ticks" :class="{ 'bubble__ticks--read': msg.delivered === 'read', 'bubble__ticks--delivered': msg.delivered === 'delivered' }">
+                      <svg v-if="msg.delivered === 'sent'" width="14" height="10" viewBox="0 0 14 10" fill="none">
+                        <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                      <svg v-else width="14" height="10" viewBox="0 0 14 10" fill="none">
+                        <path d="M1 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M5 5l3 3 5-7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                      </svg>
+                    </span>
+                  </template>
                 </div>
+              </div>
+              <!-- Approval card below the bubble -->
+              <div v-if="msg.approvalId && msg.approvalStatus === 'pending'" class="bubble-approval-card">
+                <div class="approval-detail" v-if="msg.approvalDetail">
+                  <div class="approval-detail__header">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                    <span class="approval-detail__tool">{{ msg.approvalDetail.tool }}</span>
+                    <span class="approval-detail__badge">Pending</span>
+                  </div>
+                  <div class="approval-detail__args" v-if="msg.approvalDetail.tool_args">
+                    <div v-for="(val, key) in parseArgs(msg.approvalDetail.tool_args)" :key="key" class="approval-detail__arg">
+                      <span class="approval-detail__arg-key">{{ key }}:</span>
+                      <span class="approval-detail__arg-val">{{ typeof val === 'string' ? val.slice(0, 120) : JSON.stringify(val).slice(0, 120) }}</span>
+                    </div>
+                  </div>
+                </div>
+                <input v-model="msg.approvalNote" class="approval-note-input" type="text" placeholder="Note (optional)..." @click.stop @keydown.enter.stop="handleApprove(msg)" />
+                <div class="internal-msg__approval-btns">
+                  <button class="approval-btn approval-btn--approve" @click.stop="handleApprove(msg)">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                    Approve
+                  </button>
+                  <button class="approval-btn approval-btn--reject" @click.stop="handleReject(msg)">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    Reject
+                  </button>
+                </div>
+                <button class="approval-link" @click.stop="openApprovalInPanel(msg.approvalId)">View in approvals &#8594;</button>
+              </div>
+              <!-- Approved/Rejected resolved state -->
+              <div v-else-if="msg.approvalId && msg.approvalStatus === 'approved'" class="bubble-approval-card bubble-approval-card--resolved">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#10B981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                <span style="color: #10B981; font-weight: 500; font-size: 11px;">Approved</span>
+              </div>
+              <div v-else-if="msg.approvalId && msg.approvalStatus === 'rejected'" class="bubble-approval-card bubble-approval-card--resolved">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#EF4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                <span style="color: #EF4444; font-weight: 500; font-size: 11px;">Rejected</span>
+              </div>
+              <div v-else-if="msg.approvalId && (msg.approvalStatus === 'approving' || msg.approvalStatus === 'rejecting')" class="bubble-approval-card bubble-approval-card--resolved">
+                <div class="approval-spinner"></div>
+                <span style="font-size: 11px;">{{ msg.approvalStatus === 'approving' ? 'Approving' : 'Rejecting' }}...</span>
               </div>
             </div>
           </div>
@@ -2313,6 +2409,39 @@ watch(selectedContactId, async (id) => {
   background: linear-gradient(135deg, rgba(37, 211, 102, 0.06) 0%, rgba(59, 130, 246, 0.06) 100%);
   border: 1px solid rgba(37, 211, 102, 0.15);
   border-radius: 12px 2px 12px 12px;
+}
+
+.bubble--pending-approval {
+  opacity: 0.85;
+  border: 1px dashed #F59E0B;
+}
+
+.bubble__approval-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: #F59E0B;
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.bubble-approval-card {
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px dashed rgba(245, 158, 11, 0.3);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 4px;
+  max-width: 340px;
+  margin-left: auto;
+}
+
+.bubble-approval-card--resolved {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: transparent;
+  border: none;
 }
 
 /* Agent note — internal (right) */
