@@ -95,19 +95,32 @@ const statusConfig = {
 let _sid = null
 let _csrfToken = null
 
-async function frappeCall(method, params = {}) {
+async function frappeCall(method, params = {}, { timeoutMs = 30000 } = {}) {
   // Inject sid + csrf into every request body so we don't rely on browser cookies
   const body = { ...params }
   if (_sid) body.sid = _sid
   const headers = { 'Content-Type': 'application/json', Accept: 'application/json' }
   if (_csrfToken) headers['X-Frappe-CSRF-Token'] = _csrfToken
 
-  const resp = await fetch(`/api/method/${method}`, {
-    method: 'POST',
-    headers,
-    credentials: 'include',
-    body: JSON.stringify(body),
-  })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+  let resp
+  try {
+    resp = await fetch(`/api/method/${method}`, {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    })
+  } catch (e) {
+    clearTimeout(timer)
+    if (e.name === 'AbortError') throw new Error(`Request timed out after ${timeoutMs / 1000}s: ${method}`)
+    throw e
+  }
+  clearTimeout(timer)
+
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
   const data = await resp.json()
   if (data.session_expired || (data.exc_type === 'PermissionError' && data.exception?.includes('Login to access'))) {
