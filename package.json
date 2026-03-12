@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "deploy": "rm -rf dist && vite build && rm -rf ../senaBench/apps/dev_custom_app/dev_custom_app/public/whatsapp-channels/assets && cp -r dist/* ../senaBench/apps/dev_custom_app/dev_custom_app/public/whatsapp-channels/",
+    "deploy": "rm -rf dist && vite build && rm -rf ../senaBench/apps/sena_agents_backend/sena_agents_backend/public/channels/assets && cp -r dist/* ../senaBench/apps/sena_agents_backend/sena_agents_backend/public/channels/",
     "preview": "vite preview"
   },
   "dependencies": {
